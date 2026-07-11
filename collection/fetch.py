@@ -43,8 +43,8 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
-VERSION = "2.1.0"
-SCHEMA_VERSION = 2
+VERSION = "2.2.0"
+SCHEMA_VERSION = 3
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "collection" else SCRIPT_DIR
@@ -71,7 +71,8 @@ OUTPUT_COLUMNS = [
     "has_llms_txt",
     "training_bots_blocked",
     "search_bots_blocked",
-    "ai_policy_explicit",
+    "user_fetch_bots_blocked",
+    "policy_explicit",
     "scan_status",
 ]
 
@@ -82,8 +83,24 @@ TRAINING_BOTS = [
     "Applebot-Extended",
     "Meta-ExternalAgent",
 ]
-SEARCH_BOTS = ["OAI-SearchBot", "Claude-SearchBot", "PerplexityBot"]
-TRACKED_BOTS = TRAINING_BOTS + SEARCH_BOTS
+
+SEARCH_BOTS = [
+    "OAI-SearchBot",
+    "Claude-SearchBot",
+    "PerplexityBot",
+    "DuckAssistBot",
+    "MistralAI-Index",
+]
+
+USER_FETCH_BOTS = [
+    "ChatGPT-User",
+    "Claude-User",
+    "Perplexity-User",
+    "MistralAI-User",
+]
+
+TRACKED_BOTS = TRAINING_BOTS + SEARCH_BOTS + USER_FETCH_BOTS
+
 ROBOTS_FIELDS = {
     "user-agent",
     "allow",
@@ -97,7 +114,9 @@ ROBOTS_FIELDS = {
 }
 
 BLOCKED_STATES = {"none", "some", "all", "unknown"}
+
 SCAN_STATES = {"complete", "partial", "failed"}
+
 RESTRICTION_DIRECTIVES = {"disallow", "partial_disallow", "partial_allow"}
 
 
@@ -670,7 +689,7 @@ def classify_bot_policy(
 def evaluate_robots_txt(
     result: EndpointResult,
 ) -> tuple[dict[str, str] | None, bool | None, bool]:
-    """Return (bot policies, explicit AI policy, known)."""
+    """Return (bot policies, explicit policy, known)."""
 
     if result.error:
         return None, None, False
@@ -728,7 +747,8 @@ def failed_row(item: DomainInput) -> dict[str, Any]:
         "has_llms_txt": None,
         "training_bots_blocked": "unknown",
         "search_bots_blocked": "unknown",
-        "ai_policy_explicit": None,
+        "user_fetch_bots_blocked": "unknown",
+        "policy_explicit": None,
         "scan_status": "failed",
     }
 
@@ -787,7 +807,10 @@ async def process_domain(
         "search_bots_blocked": summarize_blocking(policies, SEARCH_BOTS)
         if policies
         else "unknown",
-        "ai_policy_explicit": explicit,
+        "user_fetch_bots_blocked": summarize_blocking(policies, USER_FETCH_BOTS)
+        if policies
+        else "unknown",
+        "policy_explicit": explicit,
         "scan_status": scan_status(llms_known, robots_known),
     }
 
@@ -801,12 +824,14 @@ def validate_row(row: Mapping[str, Any]) -> None:
         raise ValueError("Checkpoint row has an invalid training bot state.")
     if row.get("search_bots_blocked") not in BLOCKED_STATES:
         raise ValueError("Checkpoint row has an invalid search bot state.")
+    if row.get("user_fetch_bots_blocked") not in BLOCKED_STATES:
+        raise ValueError("Checkpoint row has an invalid user-fetch bot state.")
     if row.get("scan_status") not in SCAN_STATES:
         raise ValueError("Checkpoint row has an invalid scan status.")
     if row.get("has_llms_txt") not in {True, False, None}:
         raise ValueError("Checkpoint row has an invalid llms.txt value.")
-    if row.get("ai_policy_explicit") not in {True, False, None}:
-        raise ValueError("Checkpoint row has an invalid AI policy value.")
+    if row.get("policy_explicit") not in {True, False, None}:
+        raise ValueError("Checkpoint row has an invalid policy value.")
 
 
 def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
