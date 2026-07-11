@@ -1,0 +1,19 @@
+[project]
+name = "ai-web-signals"
+version = "0.1.0"
+description = "Collect and structure public web signals related to AI access, discovery, and readiness."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "beautifulsoup4>=4.15.0",
+  "httpx[http2]>=0.28.1",
+  "markdown-it-py>=4.2.0",
+  "pyarrow>=25.0.0",
+]
+
+[dependency-groups]
+dev = ["ruff>=0.14.0"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
