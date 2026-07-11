@@ -3,7 +3,7 @@
 Fetch and deterministically parse AI-related web readiness endpoints.
 
 Input:
-    data/input/cloudflare-radar_top-100-domains_20260710.csv
+    A CSV path supplied as the positional ``input`` argument.
 
 Outputs:
     data/raw/fetches.jsonl.gz       Audit artifact with bounded response bodies.
@@ -11,8 +11,9 @@ Outputs:
     data/processed/domains.csv      Convenience inspection artifact.
     data/raw/run_summary.json       Operational run summary.
 
-Example:
-    uv run python collection/fetch.py --resume
+Examples:
+    uv run python collection/fetch.py data/input/domains.csv
+    uv run python collection/fetch.py data/input/domains.csv --resume
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence, TextIO
 from urllib.parse import urljoin, urlparse
 
 import httpx
@@ -47,16 +48,13 @@ from markdown_it import MarkdownIt
 # Configuration and constants
 # ---------------------------------------------------------------------------
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_INPUT_PATH = (
-    REPO_ROOT / "data/input/cloudflare-radar_top-100-domains_20260710.csv"
-)
 DEFAULT_RAW_PATH = REPO_ROOT / "data/raw/fetches.jsonl.gz"
 DEFAULT_PARQUET_PATH = REPO_ROOT / "data/processed/domains.parquet"
 DEFAULT_CSV_PATH = REPO_ROOT / "data/processed/domains.csv"
 DEFAULT_SUMMARY_PATH = REPO_ROOT / "data/raw/run_summary.json"
-DEFAULT_USER_AGENT = "AIWebReadinessStudy/0.1"
+DEFAULT_USER_AGENT = f"AIWebReadinessStudy/{VERSION}"
 DEFAULT_CONCURRENCY = 30
 DEFAULT_DOMAIN_CONCURRENCY = 3
 DEFAULT_LOG_EVERY = 100
@@ -156,7 +154,6 @@ class DomainInput:
 
 @dataclass(frozen=True)
 class FetchSpec:
-    name: str
     max_bytes: int
 
 
@@ -454,7 +451,7 @@ def count_record_errors(record: Mapping[str, Any]) -> int:
 # ---------------------------------------------------------------------------
 
 
-def classify_httpx_error(exc: BaseException) -> tuple[str, str]:
+def classify_httpx_error(exc: Exception) -> tuple[str, str]:
     message = str(exc).strip() or exc.__class__.__name__
     if isinstance(exc, httpx.ConnectTimeout):
         return "connect_timeout", message
@@ -479,7 +476,7 @@ def classify_httpx_error(exc: BaseException) -> tuple[str, str]:
     return "unknown_error", message
 
 
-def should_retry_exception(exc: BaseException) -> bool:
+def should_retry_exception(exc: Exception) -> bool:
     if isinstance(exc, (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout)):
         return True
     if isinstance(exc, httpx.ConnectError):
@@ -617,7 +614,7 @@ async def fetch_homepage(
 ) -> dict[str, Any]:
     https_url = f"https://{domain}/"
     result = await fetch_response(
-        client, semaphore, https_url, FetchSpec("homepage", HOMEPAGE_LIMIT)
+        client, semaphore, https_url, FetchSpec(HOMEPAGE_LIMIT)
     )
     if result.get("status_code") is not None:
         result["used_http_fallback"] = False
@@ -632,7 +629,7 @@ async def fetch_homepage(
     }:
         http_url = f"http://{domain}/"
         fallback = await fetch_response(
-            client, semaphore, http_url, FetchSpec("homepage", HOMEPAGE_LIMIT)
+            client, semaphore, http_url, FetchSpec(HOMEPAGE_LIMIT)
         )
         fallback["used_http_fallback"] = True
         fallback["https_error_type"] = result.get("error_type")
@@ -1142,11 +1139,11 @@ async def process_domain(
         base = f"{final_scheme}://{final_host}"
 
         endpoint_specs = {
-            "robots": (f"{base}/robots.txt", FetchSpec("robots", ROBOTS_LIMIT)),
-            "llms_txt": (f"{base}/llms.txt", FetchSpec("llms_txt", LLMS_LIMIT)),
+            "robots": (f"{base}/robots.txt", FetchSpec(ROBOTS_LIMIT)),
+            "llms_txt": (f"{base}/llms.txt", FetchSpec(LLMS_LIMIT)),
             "llms_full_txt": (
                 f"{base}/llms-full.txt",
-                FetchSpec("llms_full_txt", LLMS_FULL_LIMIT),
+                FetchSpec(LLMS_FULL_LIMIT),
             ),
         }
 
@@ -1230,12 +1227,10 @@ def open_jsonl_text(path: Path, mode: str):
     return path.open(mode, encoding="utf-8")
 
 
-def append_jsonl(path: Path, record: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open_jsonl_text(path, "a") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
-        handle.write("\n")
-        handle.flush()
+def write_jsonl_record(handle: TextIO, record: Mapping[str, Any]) -> None:
+    handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")))
+    handle.write("\n")
+    handle.flush()
 
 
 def iter_jsonl(
@@ -1604,6 +1599,8 @@ async def async_main(args: argparse.Namespace) -> int:
 
     if skipped:
         logging.warning("Skipped %s input rows.", len(skipped))
+    if not domains:
+        raise ValueError(f"No valid domains found in {args.input}")
 
     completed: set[str] = set()
     if args.resume and raw_path.exists():
@@ -1655,7 +1652,8 @@ async def async_main(args: argparse.Namespace) -> int:
         for item in pending:
             queue.put_nowait(item)
 
-        worker_count = min(args.domain_workers, len(pending)) if pending else 0
+        domain_workers = args.domain_workers or args.concurrency
+        worker_count = min(domain_workers, len(pending)) if pending else 0
         for _ in range(worker_count):
             queue.put_nowait(None)
 
@@ -1677,30 +1675,32 @@ async def async_main(args: argparse.Namespace) -> int:
 
         workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
 
-        for index in range(len(pending)):
-            record = await result_queue.get()
-            append_jsonl(raw_path, record)
-            stats.update(record)
-            result_queue.task_done()
+        if pending:
+            with open_jsonl_text(raw_path, "a") as raw_handle:
+                for index in range(len(pending)):
+                    record = await result_queue.get()
+                    write_jsonl_record(raw_handle, record)
+                    stats.update(record)
+                    result_queue.task_done()
 
-            now = time.monotonic()
-            if (
-                stats.processed % args.log_every == 0
-                or now - last_progress_at >= args.progress_seconds
-                or index + 1 == len(pending)
-            ):
-                total_done = len(completed) + stats.processed
-                logging.info(
-                    "Processed %s / %s domains | homepage reachable: %s | "
-                    "robots candidates: %s | llms.txt candidates: %s | errors: %s",
-                    total_done,
-                    len(domains),
-                    stats.homepage_reachable,
-                    stats.robots_candidates,
-                    stats.llms_candidates,
-                    stats.domains_with_errors,
-                )
-                last_progress_at = now
+                    now = time.monotonic()
+                    if (
+                        stats.processed % args.log_every == 0
+                        or now - last_progress_at >= args.progress_seconds
+                        or index + 1 == len(pending)
+                    ):
+                        total_done = len(completed) + stats.processed
+                        logging.info(
+                            "Processed %s / %s domains | homepage reachable: %s | "
+                            "robots candidates: %s | llms.txt candidates: %s | errors: %s",
+                            total_done,
+                            len(domains),
+                            stats.homepage_reachable,
+                            stats.robots_candidates,
+                            stats.llms_candidates,
+                            stats.domains_with_errors,
+                        )
+                        last_progress_at = now
 
         await queue.join()
         await asyncio.gather(*workers)
@@ -1748,10 +1748,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Fetch and parse robots.txt, llms.txt, and llms-full.txt."
     )
     parser.add_argument(
-        "--input",
+        "input",
         type=Path,
-        default=DEFAULT_INPUT_PATH,
-        help="Input CSV path.",
+        help="Path to the input CSV containing domains.",
     )
     parser.add_argument(
         "--raw-output",
@@ -1782,7 +1781,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY)
-    parser.add_argument("--domain-workers", type=int, default=30)
+    parser.add_argument(
+        "--domain-workers",
+        type=int,
+        default=None,
+        help="Number of domain workers. Defaults to --concurrency.",
+    )
     parser.add_argument(
         "--per-domain-concurrency", type=int, default=DEFAULT_DOMAIN_CONCURRENCY
     )
@@ -1809,7 +1813,7 @@ def main() -> int:
 
     if args.concurrency < 1:
         parser.error("--concurrency must be at least 1")
-    if args.domain_workers < 1:
+    if args.domain_workers is not None and args.domain_workers < 1:
         parser.error("--domain-workers must be at least 1")
     if args.per_domain_concurrency < 1:
         parser.error("--per-domain-concurrency must be at least 1")
@@ -1817,6 +1821,22 @@ def main() -> int:
         parser.error("--limit must be at least 1")
     if args.resume and args.overwrite:
         parser.error("--resume and --overwrite cannot be used together")
+    if args.log_every < 1:
+        parser.error("--log-every must be at least 1")
+    if args.progress_seconds <= 0:
+        parser.error("--progress-seconds must be greater than 0")
+    for option, value in (
+        ("--connect-timeout", args.connect_timeout),
+        ("--read-timeout", args.read_timeout),
+        ("--write-timeout", args.write_timeout),
+        ("--pool-timeout", args.pool_timeout),
+    ):
+        if value <= 0:
+            parser.error(f"{option} must be greater than 0")
+    if not args.input.exists():
+        parser.error(f"input file does not exist: {args.input}")
+    if not args.input.is_file():
+        parser.error(f"input path is not a file: {args.input}")
 
     logging.basicConfig(
         level=getattr(logging, args.log_level),
