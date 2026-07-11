@@ -52,10 +52,10 @@ except ImportError as exc:  # pragma: no cover - exercised by CLI users.
     ) from exc
 
 
-VERSION = "1.0.0"
-SCHEMA_VERSION = 4
-CHECKPOINT_SCHEMA_VERSION = 1
-CRAWLER_SET_VERSION = 1
+VERSION = "1.1.0"
+SCHEMA_VERSION = 5
+CHECKPOINT_SCHEMA_VERSION = 2
+AI_POLICY_SET_VERSION = 2
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_CHECKPOINT_PATH = REPO_ROOT / "data/raw/domains_checkpoint.jsonl"
 DEFAULT_PARQUET_PATH = REPO_ROOT / "data/processed/domains.parquet"
@@ -87,16 +87,26 @@ SOURCE_LICENSE = "CC BY-NC 4.0"
 SOURCE_LICENSE_URL = "https://creativecommons.org/licenses/by-nc/4.0/"
 SOURCE_LICENSE_REFERENCE_URL = "https://developers.cloudflare.com/radar/"
 
-TRACKED_AGENTS = {
+# AI-specific robots.txt tokens only. Some entries, such as Google-Extended
+# and Applebot-Extended, are data-use controls rather than independent crawlers.
+TRACKED_AI_TOKENS = {
     "gptbot": "gptbot_directive",
-    "oai-searchbot": "oai_searchbot_directive",
     "claudebot": "claudebot_directive",
+    "google-extended": "google_extended_directive",
+    "applebot-extended": "applebot_extended_directive",
+    "meta-externalagent": "meta_externalagent_directive",
+    "oai-searchbot": "oai_searchbot_directive",
     "claude-searchbot": "claude_searchbot_directive",
     "perplexitybot": "perplexitybot_directive",
-    "google-extended": "google_extended_directive",
 }
-CRAWLER_GROUPS = {
-    "model_development": ["GPTBot", "ClaudeBot", "Google-Extended"],
+AI_POLICY_GROUPS = {
+    "model_development": [
+        "GPTBot",
+        "ClaudeBot",
+        "Google-Extended",
+        "Applebot-Extended",
+        "Meta-ExternalAgent",
+    ],
     "ai_search": ["OAI-SearchBot", "Claude-SearchBot", "PerplexityBot"],
 }
 DIRECTIVE_VALUES = {
@@ -122,6 +132,7 @@ ERROR_VALUES = {
     "parse_error",
     "invalid_url",
     "private_address",
+    "internal_error",
 }
 LLMS_OUTCOME_VALUES = {
     "present",
@@ -176,6 +187,44 @@ class EndpointResult:
     error: str | None
 
 
+@dataclass
+class RequestStats:
+    attempts: int = 0
+    retries: int = 0
+    redirects_followed: int = 0
+    http_fallbacks: int = 0
+    response_bytes_read: int = 0
+
+    def to_json(self) -> dict[str, int]:
+        return {
+            "attempts": self.attempts,
+            "retries": self.retries,
+            "redirects_followed": self.redirects_followed,
+            "http_fallbacks": self.http_fallbacks,
+            "response_bytes_read": self.response_bytes_read,
+        }
+
+
+class HostSafetyCache:
+    """Coalesce and cache per-host DNS safety checks for the current run."""
+
+    def __init__(self) -> None:
+        self._tasks: dict[str, asyncio.Task[str | None]] = {}
+
+    async def check(self, host: str) -> str | None:
+        key = host.lower().rstrip(".")
+        task = self._tasks.get(key)
+        if task is None:
+            task = asyncio.create_task(asyncio.to_thread(resolve_host_safety_sync, key))
+            self._tasks[key] = task
+        try:
+            return await asyncio.shield(task)
+        except BaseException:
+            if self._tasks.get(key) is task:
+                self._tasks.pop(key, None)
+            raise
+
+
 class SummaryCounters:
     def __init__(self) -> None:
         self.processed_domains = 0
@@ -202,13 +251,13 @@ class SummaryCounters:
         )
         self.directive_counts = {
             column: Counter({value: 0 for value in sorted(DIRECTIVE_VALUES)})
-            for column in TRACKED_AGENTS.values()
+            for column in TRACKED_AI_TOKENS.values()
         }
         self.directive_source_counts = {
             column.replace("_directive", "_directive_source"): Counter(
                 {value: 0 for value in sorted(DIRECTIVE_SOURCE_VALUES)}
             )
-            for column in TRACKED_AGENTS.values()
+            for column in TRACKED_AI_TOKENS.values()
         }
 
     def update(self, row: Mapping[str, Any]) -> None:
@@ -253,7 +302,7 @@ class SummaryCounters:
             }
         ):
             self.domains_with_endpoint_errors += 1
-        for column in TRACKED_AGENTS.values():
+        for column in TRACKED_AI_TOKENS.values():
             value = str(row.get(column) or "error")
             self.directive_counts[column][value] += 1
             source_column = column.replace("_directive", "_directive_source")
@@ -712,40 +761,44 @@ def resolve_host_safety_sync(host: str) -> str | None:
     return None
 
 
-async def validate_request_url(url: str) -> str | None:
+async def validate_request_url(url: str, safety_cache: HostSafetyCache) -> str | None:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         return "invalid_url"
     if parsed.username is not None or parsed.password is not None:
         return "invalid_url"
-    return await asyncio.to_thread(resolve_host_safety_sync, parsed.hostname)
+    return await safety_cache.check(parsed.hostname)
 
 
 async def read_limited(response: httpx.Response, limit: int) -> tuple[bytes, bool]:
     chunks: list[bytes] = []
     total = 0
     truncated = False
-    async for chunk in response.aiter_bytes():
-        if not chunk:
-            continue
-        remaining = limit - total
-        if remaining <= 0:
-            truncated = True
-            break
-        if len(chunk) > remaining:
-            chunks.append(chunk[:remaining])
-            total += remaining
-            truncated = True
-            break
-        chunks.append(chunk)
-        total += len(chunk)
-    await response.aclose()
+    try:
+        async for chunk in response.aiter_bytes():
+            if not chunk:
+                continue
+            remaining = limit - total
+            if remaining <= 0:
+                truncated = True
+                break
+            if len(chunk) > remaining:
+                chunks.append(chunk[:remaining])
+                total += remaining
+                truncated = True
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    finally:
+        await response.aclose()
     return b"".join(chunks), truncated
 
 
 async def fetch_once(
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
+    safety_cache: HostSafetyCache,
+    request_stats: RequestStats,
     url: str,
     limit: int,
 ) -> EndpointResult:
@@ -757,7 +810,7 @@ async def fetch_once(
         try:
             retry_delay: float | None = None
             while True:
-                safety_error = await validate_request_url(current_url)
+                safety_error = await validate_request_url(current_url, safety_cache)
                 if safety_error is not None:
                     return EndpointResult(
                         requested_url=url,
@@ -773,12 +826,14 @@ async def fetch_once(
 
                 async with semaphore:
                     request = client.build_request("GET", current_url)
+                    request_stats.attempts += 1
                     response = await client.send(request, stream=True)
                     status_code = response.status_code
                     if 300 <= status_code < 400 and response.headers.get("location"):
                         location = response.headers["location"]
                         await response.aclose()
                         redirects += 1
+                        request_stats.redirects_followed += 1
                         if redirects > DEFAULT_REDIRECT_LIMIT:
                             return EndpointResult(
                                 requested_url=url,
@@ -815,6 +870,7 @@ async def fetch_once(
                             response.headers.get("retry-after")
                         )
                         await response.aclose()
+                        request_stats.retries += 1
                         retry_delay = (
                             retry_after
                             if retry_after is not None
@@ -822,6 +878,7 @@ async def fetch_once(
                         )
                     else:
                         body, truncated = await read_limited(response, limit)
+                        request_stats.response_bytes_read += len(body)
                         return EndpointResult(
                             requested_url=url,
                             final_url=str(response.url),
@@ -845,6 +902,7 @@ async def fetch_once(
         except httpx.HTTPError as exc:
             error = classify_httpx_error(exc)
             if attempts <= len(RETRY_DELAYS) and should_retry_exception(exc):
+                request_stats.retries += 1
                 delay = RETRY_DELAYS[attempts - 1] + random.uniform(0.0, 0.3)
                 await asyncio.sleep(delay)
                 continue
@@ -865,16 +923,33 @@ async def fetch_once(
 async def fetch_endpoint(
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
+    safety_cache: HostSafetyCache,
+    request_stats: RequestStats,
     domain: str,
     path: str,
     limit: int,
 ) -> EndpointResult:
-    https_result = await fetch_once(client, semaphore, f"https://{domain}{path}", limit)
+    https_result = await fetch_once(
+        client,
+        semaphore,
+        safety_cache,
+        request_stats,
+        f"https://{domain}{path}",
+        limit,
+    )
     if https_result.status is not None or not should_try_http_fallback(
         https_result.error
     ):
         return https_result
-    http_result = await fetch_once(client, semaphore, f"http://{domain}{path}", limit)
+    request_stats.http_fallbacks += 1
+    http_result = await fetch_once(
+        client,
+        semaphore,
+        safety_cache,
+        request_stats,
+        f"http://{domain}{path}",
+        limit,
+    )
     return replace(http_result, requested_url=https_result.requested_url)
 
 
@@ -942,6 +1017,10 @@ def looks_like_html_error(text: str) -> bool:
     return any(re.search(pattern, sample) for pattern in HTML_ERROR_PATTERNS)
 
 
+def is_success_status(status: int | None) -> bool:
+    return status is not None and 200 <= status < 300
+
+
 def controlled_error(value: str | None) -> str | None:
     if value is None:
         return None
@@ -995,7 +1074,7 @@ def evaluate_llms_txt(result: EndpointResult) -> dict[str, Any]:
             "llms_txt_outcome": "not_found",
             "llms_txt_error": None,
         }
-    if result.status != 200:
+    if not is_success_status(result.status):
         return {
             **base,
             "llms_txt_present": False,
@@ -1067,11 +1146,24 @@ def strip_robots_comment(line: str) -> str:
     return line
 
 
+ROBOTS_RECOGNIZED_FIELDS = {
+    "user-agent",
+    "allow",
+    "disallow",
+    "sitemap",
+    "crawl-delay",
+    "host",
+    "clean-param",
+    "request-rate",
+    "visit-time",
+}
+
+
 def parse_robots_groups(text: str) -> tuple[list[dict[str, Any]], bool]:
     groups: list[dict[str, Any]] = []
     current_agents: list[str] = []
     current_rules: list[dict[str, str]] = []
-    saw_directive = False
+    saw_recognized_field = False
 
     def flush_group() -> None:
         nonlocal current_agents, current_rules
@@ -1088,7 +1180,7 @@ def parse_robots_groups(text: str) -> tuple[list[dict[str, Any]], bool]:
     for raw_line in text.splitlines():
         line = strip_robots_comment(raw_line).strip()
         if not line:
-            if current_agents and current_rules:
+            if current_agents:
                 flush_group()
             continue
         if ":" not in line:
@@ -1096,19 +1188,18 @@ def parse_robots_groups(text: str) -> tuple[list[dict[str, Any]], bool]:
         key, value = line.split(":", 1)
         key = key.strip().lower()
         value = value.strip()
+        if key in ROBOTS_RECOGNIZED_FIELDS:
+            saw_recognized_field = True
         if key == "user-agent":
-            saw_directive = True
             if current_agents and current_rules:
                 flush_group()
             if value:
                 current_agents.append(value.lower())
-        elif key in {"allow", "disallow"}:
-            saw_directive = True
-            if current_agents:
-                current_rules.append({"directive": key, "path": value})
+        elif key in {"allow", "disallow"} and current_agents:
+            current_rules.append({"directive": key, "path": value})
 
     flush_group()
-    return groups, saw_directive and bool(groups)
+    return groups, saw_recognized_field
 
 
 def classify_rules(rules: Sequence[Mapping[str, str]]) -> str:
@@ -1142,20 +1233,30 @@ def classify_rules(rules: Sequence[Mapping[str, str]]) -> str:
 def classify_agent_policy(
     groups: Sequence[Mapping[str, Any]], agent: str
 ) -> tuple[str, str]:
-    exact_rules: list[Mapping[str, str]] = []
-    wildcard_rules: list[Mapping[str, str]] = []
+    exact_groups: list[Mapping[str, Any]] = []
+    wildcard_groups: list[Mapping[str, Any]] = []
+    target = agent.lower()
     for group in groups:
         agents = [str(item).lower() for item in group.get("agents", [])]
-        rules = group.get("rules", [])
-        if agent.lower() in agents:
-            exact_rules.extend(rules)
+        if target in agents:
+            exact_groups.append(group)
         elif "*" in agents:
-            wildcard_rules.extend(rules)
-    if exact_rules:
-        return classify_rules(exact_rules), "explicit"
-    if wildcard_rules:
-        return classify_rules(wildcard_rules), "wildcard"
-    return "none", "none"
+            wildcard_groups.append(group)
+
+    selected_groups = exact_groups or wildcard_groups
+    if not selected_groups:
+        return "none", "none"
+    rules = [rule for group in selected_groups for rule in group.get("rules", [])]
+    source = "explicit" if exact_groups else "wildcard"
+    return classify_rules(rules), source
+
+
+def policy_defaults(directive: str, source: str) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for column in TRACKED_AI_TOKENS.values():
+        values[column] = directive
+        values[column.replace("_directive", "_directive_source")] = source
+    return values
 
 
 def evaluate_robots_txt(result: EndpointResult) -> dict[str, Any]:
@@ -1167,19 +1268,15 @@ def evaluate_robots_txt(result: EndpointResult) -> dict[str, Any]:
         "robots_txt_content_type": result.content_type,
         "robots_txt_truncated": result.truncated,
     }
-    error_directives = {column: "error" for column in TRACKED_AGENTS.values()}
-    error_sources = {
-        column.replace("_directive", "_directive_source"): "error"
-        for column in TRACKED_AGENTS.values()
-    }
+    error_policies = policy_defaults("error", "error")
+    no_policies = policy_defaults("none", "none")
     if result.error:
         return {
             **base,
             "robots_txt_present": False,
             "robots_txt_outcome": "network_error",
             "robots_txt_error": result.error,
-            **error_directives,
-            **error_sources,
+            **error_policies,
         }
     if result.status in {404, 410}:
         return {
@@ -1187,17 +1284,15 @@ def evaluate_robots_txt(result: EndpointResult) -> dict[str, Any]:
             "robots_txt_present": False,
             "robots_txt_outcome": "not_found",
             "robots_txt_error": None,
-            **error_directives,
-            **error_sources,
+            **no_policies,
         }
-    if result.status != 200:
+    if not is_success_status(result.status):
         return {
             **base,
             "robots_txt_present": False,
             "robots_txt_outcome": "http_error",
             "robots_txt_error": None,
-            **error_directives,
-            **error_sources,
+            **error_policies,
         }
     if not result.body_sample:
         return {
@@ -1205,8 +1300,7 @@ def evaluate_robots_txt(result: EndpointResult) -> dict[str, Any]:
             "robots_txt_present": False,
             "robots_txt_outcome": "empty",
             "robots_txt_error": None,
-            **error_directives,
-            **error_sources,
+            **no_policies,
         }
     text = decode_text_sample(result.body_sample)
     if text is None:
@@ -1215,8 +1309,7 @@ def evaluate_robots_txt(result: EndpointResult) -> dict[str, Any]:
             "robots_txt_present": False,
             "robots_txt_outcome": "non_text",
             "robots_txt_error": "unexpected_binary",
-            **error_directives,
-            **error_sources,
+            **error_policies,
         }
     if not text.strip():
         return {
@@ -1224,8 +1317,7 @@ def evaluate_robots_txt(result: EndpointResult) -> dict[str, Any]:
             "robots_txt_present": False,
             "robots_txt_outcome": "empty",
             "robots_txt_error": None,
-            **error_directives,
-            **error_sources,
+            **no_policies,
         }
     if looks_like_html(text):
         return {
@@ -1233,32 +1325,28 @@ def evaluate_robots_txt(result: EndpointResult) -> dict[str, Any]:
             "robots_txt_present": False,
             "robots_txt_outcome": "html_response",
             "robots_txt_error": None,
-            **error_directives,
-            **error_sources,
+            **error_policies,
         }
-    groups, parseable = parse_robots_groups(text)
-    if not parseable:
+    groups, recognized = parse_robots_groups(text)
+    if not recognized:
         return {
             **base,
             "robots_txt_present": False,
             "robots_txt_outcome": "parse_error",
             "robots_txt_error": "parse_error",
-            **error_directives,
-            **error_sources,
+            **error_policies,
         }
-    directives: dict[str, str] = {}
-    sources: dict[str, str] = {}
-    for agent, column in TRACKED_AGENTS.items():
+    policies: dict[str, str] = {}
+    for agent, column in TRACKED_AI_TOKENS.items():
         directive, source = classify_agent_policy(groups, agent)
-        directives[column] = directive
-        sources[column.replace("_directive", "_directive_source")] = source
+        policies[column] = directive
+        policies[column.replace("_directive", "_directive_source")] = source
     return {
         **base,
         "robots_txt_present": True,
         "robots_txt_outcome": "present",
         "robots_txt_error": None,
-        **directives,
-        **sources,
+        **policies,
     }
 
 
@@ -1300,26 +1388,73 @@ async def process_domain(
     item: DomainInput,
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
+    safety_cache: HostSafetyCache,
+    request_stats: RequestStats,
 ) -> dict[str, Any]:
-    try:
-        llms_result, robots_result = await asyncio.gather(
-            fetch_endpoint(
-                client, semaphore, item.domain, "/llms.txt", LLMS_SAMPLE_LIMIT
-            ),
-            fetch_endpoint(
-                client, semaphore, item.domain, "/robots.txt", ROBOTS_SAMPLE_LIMIT
-            ),
+    results = await asyncio.gather(
+        fetch_endpoint(
+            client,
+            semaphore,
+            safety_cache,
+            request_stats,
+            item.domain,
+            "/llms.txt",
+            LLMS_SAMPLE_LIMIT,
+        ),
+        fetch_endpoint(
+            client,
+            semaphore,
+            safety_cache,
+            request_stats,
+            item.domain,
+            "/robots.txt",
+            ROBOTS_SAMPLE_LIMIT,
+        ),
+        return_exceptions=True,
+    )
+
+    endpoint_results: list[EndpointResult] = []
+    collection_complete = True
+    for path, value in zip(("/llms.txt", "/robots.txt"), results, strict=True):
+        if isinstance(value, Exception):
+            collection_complete = False
+            logging.debug(
+                "Endpoint processing failed for %s%s: %r",
+                item.domain,
+                path,
+                value,
+            )
+            endpoint_results.append(
+                failed_endpoint(item.domain, path, "internal_error")
+            )
+        else:
+            endpoint_results.append(value)
+
+    return compact_row(
+        item,
+        endpoint_results[0],
+        endpoint_results[1],
+        collection_complete,
+    )
+
+
+DICTIONARY_STRING_TYPE = pa.dictionary(pa.int8(), pa.string())
+
+
+def ai_policy_schema_fields() -> list[pa.Field]:
+    fields: list[pa.Field] = []
+    for column in TRACKED_AI_TOKENS.values():
+        fields.extend(
+            [
+                pa.field(column, DICTIONARY_STRING_TYPE, nullable=False),
+                pa.field(
+                    column.replace("_directive", "_directive_source"),
+                    DICTIONARY_STRING_TYPE,
+                    nullable=False,
+                ),
+            ]
         )
-        return compact_row(item, llms_result, robots_result, True)
-    except Exception as exc:
-        error = classify_httpx_error(exc)
-        logging.debug("Domain processing failed for %s: %r", item.domain, exc)
-        return compact_row(
-            item,
-            failed_endpoint(item.domain, "/llms.txt", error),
-            failed_endpoint(item.domain, "/robots.txt", error),
-            False,
-        )
+    return fields
 
 
 PARQUET_SCHEMA = pa.schema(
@@ -1333,92 +1468,31 @@ PARQUET_SCHEMA = pa.schema(
         pa.field("llms_txt_present", pa.bool_(), nullable=False),
         pa.field("llms_txt_bytes_read", pa.int64(), nullable=False),
         pa.field("llms_txt_content_type", pa.string()),
-        pa.field(
-            "llms_txt_outcome", pa.dictionary(pa.int8(), pa.string()), nullable=False
-        ),
+        pa.field("llms_txt_outcome", DICTIONARY_STRING_TYPE, nullable=False),
         pa.field("llms_txt_truncated", pa.bool_(), nullable=False),
         pa.field("llms_txt_has_h1", pa.bool_(), nullable=False),
         pa.field("llms_txt_heading_count", pa.int32(), nullable=False),
         pa.field("llms_txt_link_count", pa.int32(), nullable=False),
         pa.field("llms_txt_references_llms_full", pa.bool_(), nullable=False),
-        pa.field("llms_txt_error", pa.dictionary(pa.int8(), pa.string())),
+        pa.field("llms_txt_error", DICTIONARY_STRING_TYPE),
         pa.field("robots_txt_url", pa.string()),
         pa.field("robots_txt_final_url", pa.string()),
         pa.field("robots_txt_status", pa.int16()),
         pa.field("robots_txt_present", pa.bool_(), nullable=False),
         pa.field("robots_txt_bytes_read", pa.int64(), nullable=False),
         pa.field("robots_txt_content_type", pa.string()),
-        pa.field(
-            "robots_txt_outcome", pa.dictionary(pa.int8(), pa.string()), nullable=False
-        ),
+        pa.field("robots_txt_outcome", DICTIONARY_STRING_TYPE, nullable=False),
         pa.field("robots_txt_truncated", pa.bool_(), nullable=False),
-        pa.field("robots_txt_error", pa.dictionary(pa.int8(), pa.string())),
-        pa.field(
-            "gptbot_directive", pa.dictionary(pa.int8(), pa.string()), nullable=False
-        ),
-        pa.field(
-            "gptbot_directive_source",
-            pa.dictionary(pa.int8(), pa.string()),
-            nullable=False,
-        ),
-        pa.field(
-            "oai_searchbot_directive",
-            pa.dictionary(pa.int8(), pa.string()),
-            nullable=False,
-        ),
-        pa.field(
-            "oai_searchbot_directive_source",
-            pa.dictionary(pa.int8(), pa.string()),
-            nullable=False,
-        ),
-        pa.field(
-            "claudebot_directive",
-            pa.dictionary(pa.int8(), pa.string()),
-            nullable=False,
-        ),
-        pa.field(
-            "claudebot_directive_source",
-            pa.dictionary(pa.int8(), pa.string()),
-            nullable=False,
-        ),
-        pa.field(
-            "claude_searchbot_directive",
-            pa.dictionary(pa.int8(), pa.string()),
-            nullable=False,
-        ),
-        pa.field(
-            "claude_searchbot_directive_source",
-            pa.dictionary(pa.int8(), pa.string()),
-            nullable=False,
-        ),
-        pa.field(
-            "perplexitybot_directive",
-            pa.dictionary(pa.int8(), pa.string()),
-            nullable=False,
-        ),
-        pa.field(
-            "perplexitybot_directive_source",
-            pa.dictionary(pa.int8(), pa.string()),
-            nullable=False,
-        ),
-        pa.field(
-            "google_extended_directive",
-            pa.dictionary(pa.int8(), pa.string()),
-            nullable=False,
-        ),
-        pa.field(
-            "google_extended_directive_source",
-            pa.dictionary(pa.int8(), pa.string()),
-            nullable=False,
-        ),
+        pa.field("robots_txt_error", DICTIONARY_STRING_TYPE),
+        *ai_policy_schema_fields(),
         pa.field("collection_complete", pa.bool_(), nullable=False),
     ]
 )
 PARQUET_COLUMNS = PARQUET_SCHEMA.names
-CRAWLER_COLUMNS = [
+AI_POLICY_COLUMNS = [
     column for column in PARQUET_COLUMNS if column.endswith("_directive")
 ]
-CRAWLER_SOURCE_COLUMNS = [
+AI_POLICY_SOURCE_COLUMNS = [
     column for column in PARQUET_COLUMNS if column.endswith("_directive_source")
 ]
 LEGACY_REJECTED_COLUMNS = {
@@ -1485,12 +1559,12 @@ def validate_compact_row(row: Mapping[str, Any]) -> None:
         value = row.get(column)
         if value is not None and value not in ERROR_VALUES:
             raise ValueError(f"Invalid controlled value for {column}: {value!r}")
-    for column in CRAWLER_COLUMNS:
+    for column in AI_POLICY_COLUMNS:
         if row.get(column) not in DIRECTIVE_VALUES:
             raise ValueError(
                 f"Invalid controlled value for {column}: {row.get(column)!r}"
             )
-    for column in CRAWLER_SOURCE_COLUMNS:
+    for column in AI_POLICY_SOURCE_COLUMNS:
         if row.get(column) not in DIRECTIVE_SOURCE_VALUES:
             raise ValueError(
                 f"Invalid controlled value for {column}: {row.get(column)!r}"
@@ -1534,9 +1608,10 @@ def normalize_row_for_output(row: Mapping[str, Any]) -> dict[str, Any]:
 def table_from_rows(
     rows: Sequence[Mapping[str, Any]], schema: pa.Schema = PARQUET_SCHEMA
 ) -> pa.Table:
+    normalized_rows = [normalize_row_for_output(row) for row in rows]
     columns = {
         field.name: pa.array(
-            [normalize_row_for_output(row).get(field.name) for row in rows],
+            [row[field.name] for row in normalized_rows],
             type=field.type,
         )
         for field in schema
@@ -1576,10 +1651,19 @@ def validate_parquet_file(
             if json.loads(raw.decode("utf-8")) != value:
                 raise ValueError(f"Temporary Parquet metadata mismatch for {key}.")
 
-    table = pq.read_table(path)
-    columns = table.column_names
+    columns = parquet_file.schema_arrow.names
     if columns != PARQUET_COLUMNS:
         raise ValueError("Temporary Parquet columns are not in the expected order.")
+    validation_columns = [
+        "domain",
+        "llms_txt_outcome",
+        "robots_txt_outcome",
+        "llms_txt_error",
+        "robots_txt_error",
+        *AI_POLICY_COLUMNS,
+        *AI_POLICY_SOURCE_COLUMNS,
+    ]
+    table = pq.read_table(path, columns=validation_columns)
     domains = table.column("domain").to_pylist()
     if any(domain is None for domain in domains):
         raise ValueError("Temporary Parquet contains a null domain.")
@@ -1600,12 +1684,12 @@ def validate_parquet_file(
             raise ValueError(
                 f"Invalid controlled values in {column}: {sorted(invalid)}"
             )
-    for column in CRAWLER_COLUMNS:
+    for column in AI_POLICY_COLUMNS:
         values = set(table.column(column).to_pylist()) - {None}
         invalid = values - DIRECTIVE_VALUES
         if invalid:
             raise ValueError(f"Invalid directive values in {column}: {sorted(invalid)}")
-    for column in CRAWLER_SOURCE_COLUMNS:
+    for column in AI_POLICY_SOURCE_COLUMNS:
         values = set(table.column(column).to_pylist()) - {None}
         invalid = values - DIRECTIVE_SOURCE_VALUES
         if invalid:
@@ -1619,12 +1703,10 @@ def iter_unique_checkpoint_rows(path: Path) -> Iterator[dict[str, Any]]:
     for raw in iter_jsonl(path):
         validate_compact_row(raw)
         domain = raw.get("domain")
-        if not isinstance(domain, str) or not domain:
-            continue
-        if domain in seen:
+        if not isinstance(domain, str) or not domain or domain in seen:
             continue
         seen.add(domain)
-        yield normalize_row_for_output(raw)
+        yield {name: raw[name] for name in PARQUET_COLUMNS}
 
 
 def write_parquet_from_checkpoint(
@@ -1723,8 +1805,8 @@ def checkpoint_metadata(
         "collector_version": VERSION,
         "input_filename": input_path.name,
         "input_sha256": input_digest,
-        "crawler_set_version": CRAWLER_SET_VERSION,
-        "crawler_names": list(TRACKED_AGENTS.keys()),
+        "ai_policy_set_version": AI_POLICY_SET_VERSION,
+        "ai_policy_tokens": list(TRACKED_AI_TOKENS.keys()),
         "columns": PARQUET_COLUMNS,
         "created_at": started_at,
     }
@@ -1749,8 +1831,8 @@ def validate_checkpoint_compatibility(
         "output_schema_version": SCHEMA_VERSION,
         "collector_version": VERSION,
         "input_sha256": input_digest,
-        "crawler_set_version": CRAWLER_SET_VERSION,
-        "crawler_names": list(TRACKED_AGENTS.keys()),
+        "ai_policy_set_version": AI_POLICY_SET_VERSION,
+        "ai_policy_tokens": list(TRACKED_AI_TOKENS.keys()),
         "columns": PARQUET_COLUMNS,
     }
     mismatches = [key for key, value in expected.items() if metadata.get(key) != value]
@@ -1787,6 +1869,7 @@ def build_processed_metadata(
     concurrency: int,
     domain_workers: int,
     timeout_config: Mapping[str, float],
+    request_stats: RequestStats,
 ) -> dict[str, Any]:
     return {
         "project": {
@@ -1807,6 +1890,7 @@ def build_processed_metadata(
             "concurrency": concurrency,
             "domain_workers": domain_workers,
             "timeout_config": dict(timeout_config),
+            "request_stats": request_stats.to_json(),
             "endpoint_requests_per_domain_base": 2,
             "endpoints": ["/llms.txt", "/robots.txt"],
             "response_size_limits": {
@@ -1839,11 +1923,11 @@ def build_processed_metadata(
             "controlled_vocabularies": {
                 "llms_txt_outcome": sorted(LLMS_OUTCOME_VALUES),
                 "robots_txt_outcome": sorted(ROBOTS_OUTCOME_VALUES),
-                "crawler_directive": sorted(DIRECTIVE_VALUES),
-                "crawler_directive_source": sorted(DIRECTIVE_SOURCE_VALUES),
+                "ai_policy_directive": sorted(DIRECTIVE_VALUES),
+                "ai_policy_directive_source": sorted(DIRECTIVE_SOURCE_VALUES),
             },
-            "crawler_set_version": CRAWLER_SET_VERSION,
-            "crawler_groups": CRAWLER_GROUPS,
+            "ai_policy_set_version": AI_POLICY_SET_VERSION,
+            "ai_policy_groups": AI_POLICY_GROUPS,
         },
         "summary_counts": counters.to_json(),
     }
@@ -1874,6 +1958,7 @@ def write_summary(
     concurrency: int,
     domain_workers: int,
     timeout_config: Mapping[str, float],
+    request_stats: RequestStats,
 ) -> None:
     parquet_row_groups = (
         pq.ParquetFile(output_path).metadata.num_row_groups
@@ -1900,6 +1985,7 @@ def write_summary(
         "concurrency": concurrency,
         "domain_workers": domain_workers,
         "timeout_config": dict(timeout_config),
+        "request_stats": request_stats.to_json(),
         "retry_status_codes": sorted(RETRYABLE_STATUS_CODES),
         "retry_delays_seconds": list(RETRY_DELAYS),
         "redirect_limit": DEFAULT_REDIRECT_LIMIT,
@@ -1912,9 +1998,9 @@ def write_summary(
             "llms_txt_bytes": LLMS_SAMPLE_LIMIT,
             "robots_txt_bytes": ROBOTS_SAMPLE_LIMIT,
         },
-        "crawler_set_version": CRAWLER_SET_VERSION,
-        "crawler_groups": CRAWLER_GROUPS,
-        "crawler_names": list(TRACKED_AGENTS.keys()),
+        "ai_policy_set_version": AI_POLICY_SET_VERSION,
+        "ai_policy_groups": AI_POLICY_GROUPS,
+        "ai_policy_tokens": list(TRACKED_AI_TOKENS.keys()),
         "output_filename": output_path.name,
         "output_path": str(output_path),
         "output_rows": output_row_count,
@@ -1936,7 +2022,7 @@ def write_summary(
         "parquet_batch_size": DEFAULT_BATCH_SIZE,
         "parquet_row_groups": parquet_row_groups,
         "base_endpoint_requests": output_row_count * 2,
-        "actual_request_attempts": None,
+        "actual_request_attempts": request_stats.attempts,
     }
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(f".{path.name}.tmp")
@@ -2061,6 +2147,8 @@ async def async_main(args: argparse.Namespace) -> int:
         max_keepalive_connections=max(args.concurrency, 20),
     )
     semaphore = asyncio.Semaphore(args.concurrency)
+    safety_cache = HostSafetyCache()
+    request_stats = RequestStats()
     stats = SummaryCounters()
     last_progress_at = time.monotonic()
 
@@ -2092,7 +2180,13 @@ async def async_main(args: argparse.Namespace) -> int:
                 try:
                     if item is None:
                         return
-                    row = await process_domain(item, client, semaphore)
+                    row = await process_domain(
+                        item,
+                        client,
+                        semaphore,
+                        safety_cache,
+                        request_stats,
+                    )
                     await result_queue.put(row)
                 finally:
                     input_queue.task_done()
@@ -2145,7 +2239,7 @@ async def async_main(args: argparse.Namespace) -> int:
         "source_license_url": source_dataset.get("license_url", SOURCE_LICENSE_URL),
         "collection_started_at": started_at,
         "collection_finished_at": finished_at,
-        "crawler_set_version": CRAWLER_SET_VERSION,
+        "ai_policy_set_version": AI_POLICY_SET_VERSION,
         "generating_script": "collection/fetch.py",
     }
     row_count, final_counters = write_parquet_from_checkpoint(
@@ -2171,6 +2265,7 @@ async def async_main(args: argparse.Namespace) -> int:
         concurrency=args.concurrency,
         domain_workers=args.domain_workers,
         timeout_config=timeout_config,
+        request_stats=request_stats,
     )
     write_output_metadata_sidecar(metadata_path, processed_metadata)
     write_summary(
@@ -2197,6 +2292,7 @@ async def async_main(args: argparse.Namespace) -> int:
         concurrency=args.concurrency,
         domain_workers=args.domain_workers,
         timeout_config=timeout_config,
+        request_stats=request_stats,
     )
 
     logging.info("Wrote %s rows to %s", row_count, parquet_path)
