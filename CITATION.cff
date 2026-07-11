@@ -1,0 +1,25 @@
+cff-version: 1.2.0
+message: "If you use this software or its generated datasets, cite ai-web-signals and the Cloudflare Radar Domain Rankings source data."
+title: "ai-web-signals"
+type: software
+authors:
+  - name: "TypeError"
+repository-code: "https://github.com/TypeError/ai-web-signals"
+url: "https://github.com/TypeError/ai-web-signals"
+license: "MIT"
+version: "0.1.0"
+date-released: "2026-07-11"
+abstract: "Collect public AI-related web discovery and crawler-access signals across popular domains sourced from Cloudflare Radar."
+references:
+  - type: dataset
+    authors:
+      - name: "Cloudflare, Inc."
+    title: "Cloudflare Radar Domain Rankings"
+    url: "https://radar.cloudflare.com/domains"
+    date-accessed: "2026-07-11"
+  - type: website
+    authors:
+      - name: "Cloudflare, Inc."
+    title: "Cloudflare Radar"
+    url: "https://radar.cloudflare.com"
+    date-accessed: "2026-07-11"
