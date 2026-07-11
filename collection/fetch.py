@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Fetch and deterministically parse AI-related web readiness endpoints.
+Fetch compact V1 AI web readiness signals.
 
-Input:
-    A CSV path supplied as the positional ``input`` argument.
+The collector writes one flat row per normalized domain. Response bodies are
+bounded parsing inputs only; they are not persisted by default.
 
-Outputs:
-    data/raw/fetches.jsonl.gz       Audit artifact with bounded response bodies.
-    data/processed/domains.parquet  Primary analysis artifact for R.
-    data/processed/domains.csv      Convenience inspection artifact.
-    data/raw/run_summary.json       Operational run summary.
+Default outputs:
+    data/raw/domains_checkpoint.jsonl  Compact append-only resume checkpoint.
+    data/processed/domains.parquet     Primary analysis artifact for R.
+    data/raw/run_summary.json          Operational run summary.
 
 Examples:
-    uv run python collection/fetch.py data/input/domains.csv
+    uv run python collection/fetch.py data/input/domains.csv --overwrite
     uv run python collection/fetch.py data/input/domains.csv --resume
+    uv run python collection/fetch.py data/input/domains.csv --csv-output /tmp/domains.csv
 """
 
 from __future__ import annotations
@@ -21,52 +21,119 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
-import difflib
+import email.utils
 import gzip
 import hashlib
-import html
 import ipaddress
 import json
 import logging
+import os
 import random
 import re
 import socket
 import ssl
+import subprocess
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence, TextIO
 from urllib.parse import urljoin, urlparse
 
 import httpx
-from bs4 import BeautifulSoup
-from markdown_it import MarkdownIt
 
-# ---------------------------------------------------------------------------
-# Configuration and constants
-# ---------------------------------------------------------------------------
+try:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+except ImportError as exc:  # pragma: no cover - exercised by CLI users.
+    raise RuntimeError(
+        "pyarrow is required. Install dependencies with `uv sync`."
+    ) from exc
 
-VERSION = "0.2.0"
+
+VERSION = "1.0.0"
+SCHEMA_VERSION = 4
+CHECKPOINT_SCHEMA_VERSION = 1
+CRAWLER_SET_VERSION = 1
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_RAW_PATH = REPO_ROOT / "data/raw/fetches.jsonl.gz"
+DEFAULT_CHECKPOINT_PATH = REPO_ROOT / "data/raw/domains_checkpoint.jsonl"
 DEFAULT_PARQUET_PATH = REPO_ROOT / "data/processed/domains.parquet"
-DEFAULT_CSV_PATH = REPO_ROOT / "data/processed/domains.csv"
 DEFAULT_SUMMARY_PATH = REPO_ROOT / "data/raw/run_summary.json"
-DEFAULT_USER_AGENT = f"AIWebReadinessStudy/{VERSION}"
+DEFAULT_CSV_PATH = REPO_ROOT / "data/processed/domains.csv"
+DEFAULT_INPUT_MANIFEST_PATH = REPO_ROOT / "data/input/manifest.json"
+DEFAULT_USER_AGENT = (
+    f"AIWebSignals/{VERSION} (+https://github.com/TypeError/ai-web-signals)"
+)
 DEFAULT_CONCURRENCY = 30
-DEFAULT_DOMAIN_CONCURRENCY = 3
+DEFAULT_DOMAIN_WORKERS = 30
+DEFAULT_BATCH_SIZE = 500
 DEFAULT_LOG_EVERY = 100
 DEFAULT_PROGRESS_SECONDS = 30.0
+DEFAULT_SKIPPED_SAMPLE_SIZE = 20
+DEFAULT_REDIRECT_LIMIT = 10
 
-HOMEPAGE_LIMIT = 1 * 1024 * 1024
-ROBOTS_LIMIT = 2 * 1024 * 1024
-LLMS_LIMIT = 5 * 1024 * 1024
-LLMS_FULL_LIMIT = 10 * 1024 * 1024
-
+LLMS_SAMPLE_LIMIT = 256 * 1024
+ROBOTS_SAMPLE_LIMIT = 512 * 1024
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
 RETRY_DELAYS = (1.0, 3.0)
+MAX_RETRY_AFTER_SECONDS = 30.0
+PROJECT_NAME = "ai-web-signals"
+SOURCE_NAME = "Cloudflare Radar Domain Rankings"
+SOURCE_ORGANIZATION = "Cloudflare, Inc."
+SOURCE_URL = "https://radar.cloudflare.com/domains"
+SOURCE_HOME_URL = "https://radar.cloudflare.com"
+SOURCE_LICENSE = "CC BY-NC 4.0"
+SOURCE_LICENSE_URL = "https://creativecommons.org/licenses/by-nc/4.0/"
+SOURCE_LICENSE_REFERENCE_URL = "https://developers.cloudflare.com/radar/"
+
+TRACKED_AGENTS = {
+    "gptbot": "gptbot_directive",
+    "oai-searchbot": "oai_searchbot_directive",
+    "claudebot": "claudebot_directive",
+    "claude-searchbot": "claude_searchbot_directive",
+    "perplexitybot": "perplexitybot_directive",
+    "google-extended": "google_extended_directive",
+}
+CRAWLER_GROUPS = {
+    "model_development": ["GPTBot", "ClaudeBot", "Google-Extended"],
+    "ai_search": ["OAI-SearchBot", "Claude-SearchBot", "PerplexityBot"],
+}
+DIRECTIVE_VALUES = {
+    "allow",
+    "partial_allow",
+    "partial_disallow",
+    "disallow",
+    "none",
+    "error",
+}
+DIRECTIVE_SOURCE_VALUES = {"explicit", "wildcard", "none", "error"}
+ERROR_VALUES = {
+    "dns_error",
+    "connect_timeout",
+    "read_timeout",
+    "pool_timeout",
+    "connect_error",
+    "tls_error",
+    "redirect_error",
+    "unsafe_redirect",
+    "unexpected_binary",
+    "decode_error",
+    "parse_error",
+    "invalid_url",
+    "private_address",
+}
+LLMS_OUTCOME_VALUES = {
+    "present",
+    "not_found",
+    "empty",
+    "html_response",
+    "non_text",
+    "http_error",
+    "network_error",
+}
+ROBOTS_OUTCOME_VALUES = LLMS_OUTCOME_VALUES | {"parse_error"}
+OUTCOME_VALUES = ROBOTS_OUTCOME_VALUES
 TEXTUAL_CONTENT_TYPES = {
     "application/json",
     "application/ld+json",
@@ -75,32 +142,10 @@ TEXTUAL_CONTENT_TYPES = {
     "application/rss+xml",
     "application/atom+xml",
 }
-SOFT_404_PATTERNS = (
+HTML_ERROR_PATTERNS = (
     r"\b404\b",
-    r"\bpage not found\b",
     r"\bnot found\b",
-    r"\bdoes not exist\b",
-    r"\bmissing page\b",
-    r"\bpage is missing\b",
-    r"\bwe couldn't find\b",
-    r"\bwe could not find\b",
-)
-UNRELATED_HTML_PATH_PARTS = (
-    "/login",
-    "/signin",
-    "/sign-in",
-    "/auth/",
-    "/oauth",
-    "/authorize",
-    "/account",
-    "/404",
-    "/404.html",
-    "/04.html",
-    "/not-found",
-    "/notfound",
-)
-UNRELATED_HTML_TEXT_PATTERNS = (
-    r"\bsign in to your account\b",
+    r"\bpage not found\b",
     r"\bsign in\b",
     r"\blog in\b",
     r"\blogin\b",
@@ -108,81 +153,138 @@ UNRELATED_HTML_TEXT_PATTERNS = (
     r"\baccess denied\b",
     r"\bforbidden\b",
 )
-MARKDOWN_FEATURE_PATTERNS = {
-    "heading": re.compile(r"(?m)^\s{0,3}#{1,6}\s+\S"),
-    "link": re.compile(r"\[[^\]]+\]\([^)]+\)"),
-    "list": re.compile(r"(?m)^\s*(?:[-+*]|\d+[.)])\s+\S"),
-    "blockquote": re.compile(r"(?m)^\s*>\s+\S"),
-    "code_fence": re.compile(r"(?m)^\s*(```|~~~)"),
-}
-
-AI_AGENTS: dict[str, dict[str, str]] = {
-    "gptbot": {"provider": "openai", "purpose": "training"},
-    "oai-searchbot": {"provider": "openai", "purpose": "search"},
-    "chatgpt-user": {"provider": "openai", "purpose": "user_retrieval"},
-    "claudebot": {"provider": "anthropic", "purpose": "training_or_crawling"},
-    "claude-searchbot": {"provider": "anthropic", "purpose": "search"},
-    "google-extended": {"provider": "google", "purpose": "ai_training_control"},
-    "ccbot": {"provider": "common_crawl", "purpose": "dataset_collection"},
-    "perplexitybot": {"provider": "perplexity", "purpose": "search"},
-}
-
-POLICY_VALUES = {
-    "explicit_disallow",
-    "explicit_allow",
-    "explicit_partial",
-    "wildcard_disallow",
-    "wildcard_allow",
-    "wildcard_partial",
-    "unspecified",
-    "robots_missing",
-    "robots_unparseable",
-}
-
-MD = MarkdownIt("commonmark")
 
 
 @dataclass(frozen=True)
 class DomainInput:
     domain: str
-    source_position: int
+    rank: int | None
+    categories: str | None
     source_row: int
-    source_domain_value: str
-    source_rank: int | None
-    source_fields: dict[str, str]
 
 
 @dataclass(frozen=True)
-class FetchSpec:
-    max_bytes: int
+class EndpointResult:
+    requested_url: str
+    final_url: str | None
+    status: int | None
+    content_type: str | None
+    content_length: int | None
+    bytes_read: int
+    body_sample: bytes
+    truncated: bool
+    error: str | None
 
 
-@dataclass
-class RunStats:
-    processed: int = 0
-    homepage_reachable: int = 0
-    robots_candidates: int = 0
-    llms_candidates: int = 0
-    llms_full_candidates: int = 0
-    domains_with_errors: int = 0
+class SummaryCounters:
+    def __init__(self) -> None:
+        self.processed_domains = 0
+        self.llms_txt_present = 0
+        self.robots_txt_present = 0
+        self.collection_complete_true = 0
+        self.collection_complete_false = 0
+        self.domains_with_endpoint_errors = 0
+        self.domains_with_internal_failures = 0
+        self.llms_txt_has_h1 = 0
+        self.llms_txt_references_llms_full = 0
+        self.truncated_endpoint_responses = 0
+        self.llms_txt_outcome_counts = Counter(
+            {value: 0 for value in sorted(LLMS_OUTCOME_VALUES)}
+        )
+        self.robots_txt_outcome_counts = Counter(
+            {value: 0 for value in sorted(ROBOTS_OUTCOME_VALUES)}
+        )
+        self.llms_txt_error_counts = Counter(
+            {value: 0 for value in sorted(ERROR_VALUES)}
+        )
+        self.robots_txt_error_counts = Counter(
+            {value: 0 for value in sorted(ERROR_VALUES)}
+        )
+        self.directive_counts = {
+            column: Counter({value: 0 for value in sorted(DIRECTIVE_VALUES)})
+            for column in TRACKED_AGENTS.values()
+        }
+        self.directive_source_counts = {
+            column.replace("_directive", "_directive_source"): Counter(
+                {value: 0 for value in sorted(DIRECTIVE_SOURCE_VALUES)}
+            )
+            for column in TRACKED_AGENTS.values()
+        }
 
-    def update(self, record: Mapping[str, Any]) -> None:
-        self.processed += 1
-        if record.get("homepage", {}).get("reachable"):
-            self.homepage_reachable += 1
-        if record.get("robots", {}).get("parsed", {}).get("candidate_exists"):
-            self.robots_candidates += 1
-        if record.get("llms_txt", {}).get("parsed", {}).get("candidate_exists"):
-            self.llms_candidates += 1
-        if record.get("llms_full_txt", {}).get("parsed", {}).get("candidate_exists"):
-            self.llms_full_candidates += 1
-        if count_record_errors(record) > 0:
-            self.domains_with_errors += 1
+    def update(self, row: Mapping[str, Any]) -> None:
+        self.processed_domains += 1
+        if row.get("llms_txt_present"):
+            self.llms_txt_present += 1
+        if row.get("robots_txt_present"):
+            self.robots_txt_present += 1
+        if row.get("collection_complete"):
+            self.collection_complete_true += 1
+        else:
+            self.collection_complete_false += 1
+            self.domains_with_internal_failures += 1
+        if row.get("llms_txt_has_h1"):
+            self.llms_txt_has_h1 += 1
+        if row.get("llms_txt_references_llms_full"):
+            self.llms_txt_references_llms_full += 1
+        if row.get("llms_txt_truncated"):
+            self.truncated_endpoint_responses += 1
+        if row.get("robots_txt_truncated"):
+            self.truncated_endpoint_responses += 1
+        self.llms_txt_outcome_counts[
+            str(row.get("llms_txt_outcome") or "http_error")
+        ] += 1
+        self.robots_txt_outcome_counts[
+            str(row.get("robots_txt_outcome") or "http_error")
+        ] += 1
+        llms_error = row.get("llms_txt_error")
+        robots_error = row.get("robots_txt_error")
+        if llms_error is not None and llms_error in ERROR_VALUES:
+            self.llms_txt_error_counts[str(llms_error)] += 1
+        if robots_error is not None and robots_error in ERROR_VALUES:
+            self.robots_txt_error_counts[str(robots_error)] += 1
+        if (
+            any(value is not None for value in (llms_error, robots_error))
+            or row.get("llms_txt_outcome") in {"http_error", "network_error"}
+            or row.get("robots_txt_outcome")
+            in {
+                "http_error",
+                "network_error",
+                "parse_error",
+            }
+        ):
+            self.domains_with_endpoint_errors += 1
+        for column in TRACKED_AGENTS.values():
+            value = str(row.get(column) or "error")
+            self.directive_counts[column][value] += 1
+            source_column = column.replace("_directive", "_directive_source")
+            source = str(row.get(source_column) or "error")
+            self.directive_source_counts[source_column][source] += 1
 
-
-# ---------------------------------------------------------------------------
-# General helpers
-# ---------------------------------------------------------------------------
+    def to_json(self) -> dict[str, Any]:
+        return {
+            "processed_domains": self.processed_domains,
+            "llms_txt_present": self.llms_txt_present,
+            "robots_txt_present": self.robots_txt_present,
+            "collection_complete_true": self.collection_complete_true,
+            "collection_complete_false": self.collection_complete_false,
+            "domains_with_endpoint_errors": self.domains_with_endpoint_errors,
+            "domains_with_internal_failures": self.domains_with_internal_failures,
+            "llms_txt_has_h1": self.llms_txt_has_h1,
+            "llms_txt_references_llms_full": self.llms_txt_references_llms_full,
+            "truncated_endpoint_responses": self.truncated_endpoint_responses,
+            "llms_txt_outcome_counts": dict(self.llms_txt_outcome_counts),
+            "robots_txt_outcome_counts": dict(self.robots_txt_outcome_counts),
+            "llms_txt_error_counts": dict(self.llms_txt_error_counts),
+            "robots_txt_error_counts": dict(self.robots_txt_error_counts),
+            "directive_counts": {
+                column: dict(counter)
+                for column, counter in self.directive_counts.items()
+            },
+            "directive_source_counts": {
+                column: dict(counter)
+                for column, counter in self.directive_source_counts.items()
+            },
+        }
 
 
 def utc_now_iso() -> str:
@@ -194,34 +296,19 @@ def utc_now_iso() -> str:
     )
 
 
-def sha256_hex(data: bytes) -> str:
-    return hashlib.sha256(data).hexdigest()
-
-
 def content_type_base(value: str | None) -> str | None:
     if not value:
         return None
     return value.split(";", 1)[0].strip().lower() or None
 
 
-def is_html_content_type(content_type: str | None) -> bool:
-    return content_type in {"text/html", "application/xhtml+xml"}
-
-
-def is_textual_content_type(content_type: str | None) -> bool:
-    if content_type is None:
-        return False
-    return content_type.startswith("text/") or content_type in TEXTUAL_CONTENT_TYPES
-
-
-def looks_textual(data: bytes) -> bool:
-    if not data:
-        return True
-    sample = data[:4096]
-    if b"\x00" in sample:
-        return False
-    control = sum(1 for b in sample if b < 9 or (13 < b < 32))
-    return control / max(len(sample), 1) < 0.02
+def _parse_int(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        return None
 
 
 def normalize_domain(raw: str) -> tuple[str | None, str | None]:
@@ -252,8 +339,7 @@ def normalize_domain(raw: str) -> tuple[str | None, str | None]:
         ipaddress.ip_address(value)
         return None, "IP addresses are not accepted"
     except ValueError:
-        pass
-    return value, None
+        return value, None
 
 
 def identify_domain_column(fieldnames: Sequence[str]) -> str:
@@ -261,7 +347,6 @@ def identify_domain_column(fieldnames: Sequence[str]) -> str:
     for candidate in ("domain", "hostname", "host"):
         if candidate in lower_to_original:
             return lower_to_original[candidate]
-
     domain_like = [
         original
         for lowered, original in lower_to_original.items()
@@ -269,7 +354,6 @@ def identify_domain_column(fieldnames: Sequence[str]) -> str:
     ]
     if len(domain_like) == 1:
         return domain_like[0]
-
     raise ValueError(
         "Could not identify a domain column in input CSV. "
         f"Available columns: {', '.join(fieldnames)}"
@@ -279,6 +363,14 @@ def identify_domain_column(fieldnames: Sequence[str]) -> str:
 def identify_rank_column(fieldnames: Sequence[str]) -> str | None:
     lower_to_original = {name.strip().lower(): name for name in fieldnames}
     for candidate in ("rank", "ranking"):
+        if candidate in lower_to_original:
+            return lower_to_original[candidate]
+    return None
+
+
+def identify_categories_column(fieldnames: Sequence[str]) -> str | None:
+    lower_to_original = {name.strip().lower(): name for name in fieldnames}
+    for candidate in ("categories", "category"):
         if candidate in lower_to_original:
             return lower_to_original[candidate]
     return None
@@ -296,13 +388,103 @@ def parse_optional_int(value: str | None) -> int | None:
         return None
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def git_commit() -> str | None:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=REPO_ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    value = result.stdout.strip()
+    return value or None
+
+
+def load_input_manifest(path: Path = DEFAULT_INPUT_MANIFEST_PATH) -> dict[str, Any]:
+    if not path.exists():
+        return {"datasets": []}
+    with path.open("r", encoding="utf-8") as handle:
+        value = json.load(handle)
+    if not isinstance(value, Mapping):
+        raise ValueError(f"Input manifest must be a JSON object: {path}")
+    datasets = value.get("datasets", [])
+    if not isinstance(datasets, list):
+        raise ValueError(f"Input manifest must contain a datasets list: {path}")
+    return dict(value)
+
+
+def source_metadata_for_input(
+    input_path: Path, input_digest: str, manifest: Mapping[str, Any]
+) -> dict[str, Any]:
+    filename = input_path.name
+    datasets = manifest.get("datasets", [])
+    if isinstance(datasets, list):
+        for entry in datasets:
+            if isinstance(entry, Mapping) and entry.get("filename") == filename:
+                result = dict(entry)
+                result.setdefault("sha256", input_digest)
+                return result
+    return {
+        "filename": filename,
+        "source_name": SOURCE_NAME,
+        "source_organization": SOURCE_ORGANIZATION,
+        "source_url": SOURCE_URL,
+        "source_home_url": SOURCE_HOME_URL,
+        "downloaded_at": None,
+        "coverage_start": None,
+        "coverage_end": None,
+        "domain_count": None,
+        "ranking_scope": "unknown",
+        "ordering": "unknown",
+        "known_source_columns": None,
+        "stored_unchanged_after_download": "unknown",
+        "license": SOURCE_LICENSE,
+        "license_url": SOURCE_LICENSE_URL,
+        "sha256": input_digest,
+        "notes": "No manifest entry was found for this input file.",
+    }
+
+
+def parquet_metadata_bytes(metadata: Mapping[str, Any]) -> dict[bytes, bytes]:
+    return {
+        key.encode("utf-8"): json.dumps(value, sort_keys=True).encode("utf-8")
+        for key, value in metadata.items()
+    }
+
+
 def load_domains(
     path: Path,
     limit: int | None,
     domain_column: str | None = None,
-) -> tuple[list[DomainInput], list[dict[str, Any]], int, str, str | None]:
+    skipped_sample_size: int = DEFAULT_SKIPPED_SAMPLE_SIZE,
+) -> tuple[
+    list[DomainInput],
+    int,
+    int,
+    int,
+    int,
+    Counter[str],
+    list[dict[str, Any]],
+    str,
+    str | None,
+    str | None,
+]:
     domains: list[DomainInput] = []
-    skipped: list[dict[str, Any]] = []
+    skipped_sample: list[dict[str, Any]] = []
+    skipped_count = 0
+    duplicate_count = 0
+    skip_reasons: Counter[str] = Counter()
     seen: set[str] = set()
 
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -316,6 +498,7 @@ def load_domains(
                 f"Input CSV is missing requested domain column: {actual_domain_column}"
             )
         rank_column = identify_rank_column(fieldnames)
+        categories_column = identify_categories_column(fieldnames)
 
         input_rows = 0
         for source_position, row in enumerate(reader, start=1):
@@ -324,906 +507,61 @@ def load_domains(
             original = row.get(actual_domain_column, "")
             normalized, reason = normalize_domain(original or "")
             if reason:
-                skipped.append(
-                    {"row": source_row, "domain": original, "reason": reason}
-                )
+                skipped_count += 1
+                skip_reasons[reason] += 1
+                if len(skipped_sample) < skipped_sample_size:
+                    skipped_sample.append(
+                        {"row": source_row, "domain": original, "reason": reason}
+                    )
                 continue
             assert normalized is not None
             if normalized in seen:
-                skipped.append(
-                    {
-                        "row": source_row,
-                        "domain": original,
-                        "reason": f"duplicate after normalization: {normalized}",
-                    }
-                )
+                skipped_count += 1
+                duplicate_count += 1
+                reason = "duplicate after normalization"
+                skip_reasons[reason] += 1
+                if len(skipped_sample) < skipped_sample_size:
+                    skipped_sample.append(
+                        {
+                            "row": source_row,
+                            "domain": original,
+                            "reason": f"{reason}: {normalized}",
+                        }
+                    )
                 continue
             seen.add(normalized)
-            source_fields = {
-                str(key): (value or "").strip() for key, value in row.items()
-            }
-            source_rank = (
-                parse_optional_int(row.get(rank_column)) if rank_column else None
+            rank = parse_optional_int(row.get(rank_column)) if rank_column else None
+            categories = (
+                (row.get(categories_column) or "").strip() if categories_column else ""
             )
             domains.append(
                 DomainInput(
                     domain=normalized,
-                    source_position=source_position,
+                    rank=rank,
+                    categories=categories or None,
                     source_row=source_row,
-                    source_domain_value=(original or "").strip(),
-                    source_rank=source_rank,
-                    source_fields=source_fields,
                 )
             )
             if limit is not None and len(domains) >= limit:
                 break
 
-    return domains, skipped, input_rows, actual_domain_column, rank_column
-
-
-def decode_body(
-    data: bytes, content_type_header: str | None
-) -> tuple[str | None, str | None]:
-    if not data:
-        return "", None
-    if not looks_textual(data):
-        return None, "unexpected_binary"
-
-    charset = None
-    if content_type_header:
-        match = re.search(
-            r"charset\s*=\s*[\"']?([^;\"'\s]+)", content_type_header, re.I
-        )
-        if match:
-            charset = match.group(1).strip().lower()
-
-    encodings = [charset] if charset else []
-    encodings.extend(["utf-8", "windows-1252", "latin-1"])
-    attempted: set[str] = set()
-    for encoding in encodings:
-        if not encoding or encoding in attempted:
-            continue
-        attempted.add(encoding)
-        try:
-            return data.decode(encoding), None
-        except (LookupError, UnicodeDecodeError):
-            continue
-    return data.decode("utf-8", errors="replace"), "decode_error"
-
-
-def extract_html_title(text: str | None) -> str | None:
-    if not text:
-        return None
-    soup = BeautifulSoup(text, "html.parser")
-    if soup.title and soup.title.string:
-        title = re.sub(r"\s+", " ", soup.title.string).strip()
-        return title or None
-    return None
-
-
-def extract_visible_html_text(text: str | None) -> str:
-    if not text:
-        return ""
-    soup = BeautifulSoup(text, "html.parser")
-    for element in soup(["script", "style", "noscript", "template", "svg"]):
-        element.decompose()
-    visible = html.unescape(soup.get_text(" ", strip=True))
-    return re.sub(r"\s+", " ", visible).strip().lower()
-
-
-def normalized_plain_text(text: str | None) -> str:
-    if not text:
-        return ""
-    return re.sub(r"\s+", " ", html.unescape(text)).strip().lower()
-
-
-def looks_like_html_document(text: str | None) -> bool:
-    if not text:
-        return False
-    sample = text[:5000].lower()
-    return any(
-        marker in sample for marker in ("<!doctype html", "<html", "<head", "<body")
+    return (
+        domains,
+        input_rows,
+        len(seen),
+        skipped_count,
+        duplicate_count,
+        skip_reasons,
+        skipped_sample,
+        actual_domain_column,
+        rank_column,
+        categories_column,
     )
 
 
-def text_similarity(a: str, b: str) -> float:
-    if len(a) < 200 or len(b) < 200:
-        return 0.0
-    # Cap work for pathological pages while retaining enough text for comparison.
-    a = a[:200_000]
-    b = b[:200_000]
-    return difflib.SequenceMatcher(None, a, b, autojunk=True).ratio()
-
-
-def count_record_errors(record: Mapping[str, Any]) -> int:
-    count = 0
-    for key in ("homepage", "robots", "llms_txt", "llms_full_txt"):
-        endpoint = record.get(key, {})
-        if endpoint.get("error_type"):
-            count += 1
-    if record.get("domain_error"):
-        count += 1
-    return count
-
-
-# ---------------------------------------------------------------------------
-# HTTP helpers
-# ---------------------------------------------------------------------------
-
-
-def classify_httpx_error(exc: Exception) -> tuple[str, str]:
-    message = str(exc).strip() or exc.__class__.__name__
-    if isinstance(exc, httpx.ConnectTimeout):
-        return "connect_timeout", message
-    if isinstance(exc, httpx.ReadTimeout):
-        return "read_timeout", message
-    if isinstance(exc, httpx.PoolTimeout):
-        return "connect_timeout", message
-    if isinstance(exc, httpx.TooManyRedirects):
-        return "redirect_error", message
-    if isinstance(exc, httpx.InvalidURL):
-        return "invalid_url", message
-    if isinstance(exc, httpx.ConnectError):
-        cause = exc.__cause__
-        chain = repr(exc).lower()
-        if isinstance(cause, ssl.SSLError) or "certificate" in chain or "tls" in chain:
-            return "tls_error", message
-        if isinstance(cause, socket.gaierror) or "name or service not known" in chain:
-            return "dns_error", message
-        return "connect_error", message
-    if isinstance(exc, httpx.TransportError):
-        return "connect_error", message
-    return "unknown_error", message
-
-
-def should_retry_exception(exc: Exception) -> bool:
-    if isinstance(exc, (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.PoolTimeout)):
-        return True
-    if isinstance(exc, httpx.ConnectError):
-        error_type, _ = classify_httpx_error(exc)
-        return error_type in {"dns_error", "connect_error"}
-    return False
-
-
-async def read_limited(response: httpx.Response, limit: int) -> tuple[bytes, bool]:
-    chunks: list[bytes] = []
-    total = 0
-    truncated = False
-    async for chunk in response.aiter_bytes():
-        if not chunk:
-            continue
-        remaining = limit - total
-        if remaining <= 0:
-            truncated = True
-            break
-        if len(chunk) > remaining:
-            chunks.append(chunk[:remaining])
-            total += remaining
-            truncated = True
-            break
-        chunks.append(chunk)
-        total += len(chunk)
-    await response.aclose()
-    return b"".join(chunks), truncated
-
-
-async def fetch_response(
-    client: httpx.AsyncClient,
-    semaphore: asyncio.Semaphore,
-    url: str,
-    spec: FetchSpec,
-) -> dict[str, Any]:
-    attempts = 0
-    last_error_type: str | None = None
-    last_error_message: str | None = None
-
-    while attempts <= len(RETRY_DELAYS):
-        attempts += 1
-        started = time.perf_counter()
-        try:
-            retry_delay: float | None = None
-            async with semaphore:
-                request = client.build_request("GET", url)
-                response = await client.send(request, stream=True)
-                status_code = response.status_code
-                if status_code in RETRYABLE_STATUS_CODES and attempts <= len(
-                    RETRY_DELAYS
-                ):
-                    await response.aclose()
-                    retry_delay = RETRY_DELAYS[attempts - 1] + random.uniform(0.0, 0.3)
-                    body = b""
-                    truncated = False
-                else:
-                    body, truncated = await read_limited(response, spec.max_bytes)
-
-            if retry_delay is not None:
-                await asyncio.sleep(retry_delay)
-                continue
-
-            elapsed_ms = round((time.perf_counter() - started) * 1000)
-            content_type_header = response.headers.get("content-type")
-            content_type = content_type_base(content_type_header)
-            body_text, decode_error = decode_body(body, content_type_header)
-            error_type = decode_error
-            error_message = (
-                "Response body could not be decoded cleanly."
-                if decode_error == "decode_error"
-                else "Response appears to be binary."
-                if decode_error == "unexpected_binary"
-                else None
-            )
-
-            return {
-                "requested_url": url,
-                "final_url": str(response.url),
-                "final_host": response.url.host,
-                "final_scheme": response.url.scheme,
-                "status_code": status_code,
-                "content_type": content_type,
-                "content_type_header": content_type_header,
-                "content_length": _parse_int(response.headers.get("content-length")),
-                "elapsed_ms": elapsed_ms,
-                "redirect_count": len(response.history),
-                "redirect_chain": [str(item.url) for item in response.history],
-                "bytes_read": len(body),
-                "body_sha256": sha256_hex(body),
-                "body_text": body_text,
-                "body_truncated": truncated,
-                "attempts": attempts,
-                "error_type": error_type,
-                "error_message": error_message,
-            }
-        except httpx.HTTPError as exc:
-            elapsed_ms = round((time.perf_counter() - started) * 1000)
-            error_type, error_message = classify_httpx_error(exc)
-            last_error_type, last_error_message = error_type, error_message
-            if attempts <= len(RETRY_DELAYS) and should_retry_exception(exc):
-                delay = RETRY_DELAYS[attempts - 1] + random.uniform(0.0, 0.3)
-                await asyncio.sleep(delay)
-                continue
-            return {
-                "requested_url": url,
-                "final_url": None,
-                "final_host": None,
-                "final_scheme": None,
-                "status_code": None,
-                "content_type": None,
-                "content_type_header": None,
-                "content_length": None,
-                "elapsed_ms": elapsed_ms,
-                "redirect_count": 0,
-                "redirect_chain": [],
-                "bytes_read": 0,
-                "body_sha256": None,
-                "body_text": None,
-                "body_truncated": False,
-                "attempts": attempts,
-                "error_type": error_type,
-                "error_message": error_message,
-            }
-
-    raise RuntimeError(
-        f"Unreachable retry state: {last_error_type}: {last_error_message}"
-    )
-
-
-async def fetch_homepage(
-    client: httpx.AsyncClient,
-    semaphore: asyncio.Semaphore,
-    domain: str,
-) -> dict[str, Any]:
-    https_url = f"https://{domain}/"
-    result = await fetch_response(
-        client, semaphore, https_url, FetchSpec(HOMEPAGE_LIMIT)
-    )
-    if result.get("status_code") is not None:
-        result["used_http_fallback"] = False
-        result["reachable"] = True
-        return result
-
-    if result.get("error_type") in {
-        "dns_error",
-        "connect_timeout",
-        "connect_error",
-        "tls_error",
-    }:
-        http_url = f"http://{domain}/"
-        fallback = await fetch_response(
-            client, semaphore, http_url, FetchSpec(HOMEPAGE_LIMIT)
-        )
-        fallback["used_http_fallback"] = True
-        fallback["https_error_type"] = result.get("error_type")
-        fallback["https_error_message"] = result.get("error_message")
-        fallback["reachable"] = fallback.get("status_code") is not None
-        return fallback
-
-    result["used_http_fallback"] = False
-    result["reachable"] = False
-    return result
-
-
-def _parse_int(value: str | None) -> int | None:
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except ValueError:
-        return None
-
-
-# ---------------------------------------------------------------------------
-# llms.txt parsing and fallback detection
-# ---------------------------------------------------------------------------
-
-
-def detect_homepage_fallback(
-    homepage: Mapping[str, Any],
-    endpoint: Mapping[str, Any],
-) -> tuple[bool, list[str], float | None]:
-    reasons: list[str] = []
-    similarity: float | None = None
-
-    homepage_url = homepage.get("final_url")
-    endpoint_url = endpoint.get("final_url")
-    if homepage_url and endpoint_url and homepage_url == endpoint_url:
-        reasons.append("same_final_url")
-
-    homepage_hash = homepage.get("body_sha256")
-    endpoint_hash = endpoint.get("body_sha256")
-    if homepage_hash and endpoint_hash and homepage_hash == endpoint_hash:
-        reasons.append("same_body_hash")
-
-    homepage_type = homepage.get("content_type")
-    endpoint_type = endpoint.get("content_type")
-    both_html = is_html_content_type(homepage_type) and is_html_content_type(
-        endpoint_type
-    )
-
-    if both_html:
-        homepage_title = extract_html_title(homepage.get("body_text"))
-        endpoint_title = extract_html_title(endpoint.get("body_text"))
-        if (
-            homepage_title
-            and endpoint_title
-            and homepage_title.casefold() == endpoint_title.casefold()
-        ):
-            reasons.append("same_html_title")
-
-        homepage_visible = extract_visible_html_text(homepage.get("body_text"))
-        endpoint_visible = extract_visible_html_text(endpoint.get("body_text"))
-        similarity = text_similarity(homepage_visible, endpoint_visible)
-        if similarity >= 0.90:
-            reasons.append("html_visible_text_similarity")
-
-    return bool(reasons), reasons, similarity
-
-
-def detect_soft_404(
-    endpoint: Mapping[str, Any], homepage_fallback: bool
-) -> tuple[bool, list[str]]:
-    if endpoint.get("status_code") != 200:
-        return False, []
-    if homepage_fallback:
-        return False, []
-    if not is_html_content_type(endpoint.get("content_type")):
-        return False, []
-
-    title = extract_html_title(endpoint.get("body_text")) or ""
-    visible = extract_visible_html_text(endpoint.get("body_text"))
-    haystack = f"{title}\n{visible[:20_000]}".lower()
-    matches = [pattern for pattern in SOFT_404_PATTERNS if re.search(pattern, haystack)]
-    return bool(matches), matches
-
-
-def detect_unrelated_html_response(
-    endpoint: Mapping[str, Any],
-    markdown_like: bool,
-) -> tuple[bool, list[str]]:
-    status = endpoint.get("status_code")
-    if status is None or not (200 <= status < 300):
-        return False, []
-    if not is_html_content_type(endpoint.get("content_type")):
-        return False, []
-    body_text = endpoint.get("body_text")
-    if not isinstance(body_text, str) or not body_text.strip():
-        return False, []
-    if not looks_like_html_document(body_text):
-        return False, []
-    if markdown_like:
-        return False, []
-
-    reasons: list[str] = []
-    final_url = endpoint.get("final_url") or ""
-    parsed_url = urlparse(final_url)
-    final_path = parsed_url.path.lower()
-    if any(part in final_path for part in UNRELATED_HTML_PATH_PARTS):
-        reasons.append("unrelated_final_url_path")
-
-    title = extract_html_title(body_text) or ""
-    visible = extract_visible_html_text(body_text)
-    haystack = f"{title}\n{visible[:20_000]}".lower()
-    if any(re.search(pattern, haystack) for pattern in UNRELATED_HTML_TEXT_PATTERNS):
-        reasons.append("unrelated_html_text")
-
-    return bool(reasons), reasons
-
-
-def extract_markdown_links(text: str) -> list[str]:
-    links: list[str] = []
-    try:
-        tokens = MD.parse(text)
-    except Exception:
-        return links
-
-    for token in tokens:
-        if token.type != "inline" or not token.children:
-            continue
-        for child in token.children:
-            if child.type == "link_open":
-                href = child.attrGet("href")
-                if href:
-                    links.append(href.strip())
-    return links
-
-
-def extract_markdown_headings(text: str) -> list[tuple[int, str]]:
-    headings: list[tuple[int, str]] = []
-    try:
-        tokens = MD.parse(text)
-    except Exception:
-        return headings
-
-    for index, token in enumerate(tokens):
-        if token.type != "heading_open":
-            continue
-        level = int(token.tag[1]) if token.tag.startswith("h") else 0
-        if index + 1 < len(tokens) and tokens[index + 1].type == "inline":
-            value = tokens[index + 1].content.strip()
-            if value:
-                headings.append((level, value))
-    return headings
-
-
-def classify_link(
-    raw_url: str,
-    base_url: str,
-    endpoint_host: str | None,
-) -> tuple[str, str | None]:
-    try:
-        resolved = urljoin(base_url, raw_url)
-        parsed = urlparse(resolved)
-    except ValueError:
-        return "invalid", None
-    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        return "invalid", resolved
-    if endpoint_host and parsed.hostname.casefold() == endpoint_host.casefold():
-        if raw_url.startswith(("/", "./", "../", "#")) or not urlparse(raw_url).scheme:
-            return "relative", resolved
-        return "same_host", resolved
-    return "external", resolved
-
-
-def parse_llms_text(
-    endpoint: Mapping[str, Any],
-    homepage: Mapping[str, Any],
-) -> dict[str, Any]:
-    status = endpoint.get("status_code")
-    body_text = endpoint.get("body_text")
-    content_type = endpoint.get("content_type")
-    body_nonempty = bool(body_text and body_text.strip())
-    textual = is_textual_content_type(content_type) or (
-        content_type is None and body_nonempty
-    )
-    text = body_text if body_text is not None else ""
-
-    fallback, fallback_reasons, similarity = detect_homepage_fallback(
-        homepage, endpoint
-    )
-    soft_404, soft_404_matches = detect_soft_404(endpoint, fallback)
-    markdown_features = {
-        name: bool(pattern.search(text))
-        for name, pattern in MARKDOWN_FEATURE_PATTERNS.items()
-    }
-    markdown_like = bool(textual and body_nonempty and any(markdown_features.values()))
-    unrelated, unrelated_reasons = detect_unrelated_html_response(
-        endpoint, markdown_like
-    )
-    candidate_exists = bool(
-        status is not None
-        and 200 <= status < 300
-        and textual
-        and body_nonempty
-        and not fallback
-        and not soft_404
-        and not unrelated
-    )
-
-    headings = extract_markdown_headings(text) if candidate_exists else []
-    links = extract_markdown_links(text) if candidate_exists else []
-
-    title = None
-    for level, heading in headings:
-        if level == 1:
-            title = heading
-            break
-    if title is None and headings:
-        title = headings[0][1]
-
-    endpoint_url = endpoint.get("final_url") or endpoint.get("requested_url") or ""
-    endpoint_host = urlparse(endpoint_url).hostname
-    link_classes = Counter()
-    resolved_links: list[dict[str, str | None]] = []
-    for raw_url in links:
-        classification, resolved = classify_link(raw_url, endpoint_url, endpoint_host)
-        link_classes[classification] += 1
-        resolved_links.append(
-            {
-                "raw_url": raw_url,
-                "resolved_url": resolved,
-                "classification": classification,
-            }
-        )
-
-    llms_full_reference = any(
-        (item.get("resolved_url") or "").lower().endswith("/llms-full.txt")
-        or "llms-full.txt" in (item.get("raw_url") or "").lower()
-        for item in resolved_links
-    )
-
-    words = (
-        re.findall(r"\b[\w'-]+\b", text, flags=re.UNICODE) if candidate_exists else []
-    )
-    return {
-        "candidate_exists": candidate_exists,
-        "valid_text": textual and body_text is not None,
-        "probable_homepage_fallback": fallback,
-        "homepage_fallback_reasons": fallback_reasons,
-        "homepage_text_similarity": similarity,
-        "probable_soft_404": soft_404,
-        "soft_404_matches": soft_404_matches,
-        "probable_unrelated_response": unrelated,
-        "unrelated_response_reasons": unrelated_reasons,
-        "markdown_like": markdown_like,
-        "markdown_features": markdown_features,
-        "title": title,
-        "word_count": len(words),
-        "line_count": len(text.splitlines()) if candidate_exists else 0,
-        "heading_count": len(headings),
-        "link_count": len(links),
-        "same_host_link_count": link_classes["same_host"],
-        "relative_link_count": link_classes["relative"],
-        "first_party_link_count": link_classes["same_host"] + link_classes["relative"],
-        "external_link_count": link_classes["external"],
-        "invalid_link_count": link_classes["invalid"],
-        "llms_full_reference": llms_full_reference,
-        "headings": [{"level": level, "text": value} for level, value in headings],
-        "links": resolved_links,
-    }
-
-
-# ---------------------------------------------------------------------------
-# robots.txt parsing
-# ---------------------------------------------------------------------------
-
-
-def parse_robots_groups(text: str) -> tuple[list[dict[str, Any]], list[str], bool]:
-    groups: list[dict[str, Any]] = []
-    sitemaps: list[str] = []
-    current_agents: list[str] = []
-    current_rules: list[dict[str, str]] = []
-    parseable = False
-
-    def flush_group() -> None:
-        nonlocal current_agents, current_rules
-        if current_agents:
-            groups.append(
-                {
-                    "agents": list(dict.fromkeys(current_agents)),
-                    "rules": list(current_rules),
-                }
-            )
-        current_agents = []
-        current_rules = []
-
-    for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if not line:
-            if current_agents and current_rules:
-                flush_group()
-            continue
-        if line.startswith("#"):
-            continue
-
-        no_comment = line.split("#", 1)[0].strip()
-        if not no_comment or ":" not in no_comment:
-            continue
-        key, value = no_comment.split(":", 1)
-        key = key.strip().lower()
-        value = value.strip()
-
-        if key == "user-agent":
-            parseable = True
-            if current_agents and current_rules:
-                flush_group()
-            current_agents.append(value.lower())
-        elif key in {"allow", "disallow"}:
-            parseable = True
-            if current_agents:
-                current_rules.append({"directive": key, "path": value})
-        elif key == "sitemap":
-            parseable = True
-            if value:
-                sitemaps.append(value)
-
-    flush_group()
-    return groups, sitemaps, parseable
-
-
-def classify_rules(rules: Sequence[Mapping[str, str]], prefix: str) -> str:
-    allows = [r.get("path", "") for r in rules if r.get("directive") == "allow"]
-    disallows = [r.get("path", "") for r in rules if r.get("directive") == "disallow"]
-
-    root_disallow = "/" in disallows
-    empty_disallow = "" in disallows
-    nonempty_disallows = [path for path in disallows if path]
-    nonempty_allows = [path for path in allows if path]
-
-    if root_disallow and nonempty_allows:
-        return f"{prefix}_partial"
-    if root_disallow:
-        return f"{prefix}_disallow"
-    if nonempty_disallows:
-        return f"{prefix}_partial"
-    if nonempty_allows or empty_disallow or not rules:
-        return f"{prefix}_allow"
-    return f"{prefix}_allow"
-
-
-def classify_agent_policy(
-    groups: Sequence[Mapping[str, Any]],
-    agent: str,
-) -> str:
-    exact_rules: list[Mapping[str, str]] = []
-    wildcard_rules: list[Mapping[str, str]] = []
-
-    for group in groups:
-        agents = [str(item).lower() for item in group.get("agents", [])]
-        rules = group.get("rules", [])
-        if agent.lower() in agents:
-            exact_rules.extend(rules)
-        if "*" in agents:
-            wildcard_rules.extend(rules)
-
-    if exact_rules:
-        return classify_rules(exact_rules, "explicit")
-    if wildcard_rules:
-        return classify_rules(wildcard_rules, "wildcard")
-    return "unspecified"
-
-
-def parse_robots_text(endpoint: Mapping[str, Any]) -> dict[str, Any]:
-    status = endpoint.get("status_code")
-    body_text = endpoint.get("body_text")
-    content_type = endpoint.get("content_type")
-    textual = is_textual_content_type(content_type) or (
-        content_type is None and isinstance(body_text, str)
-    )
-    body_nonempty = bool(body_text and body_text.strip())
-    candidate_exists = bool(
-        status is not None and 200 <= status < 300 and textual and body_nonempty
-    )
-
-    policies: dict[str, str] = {}
-    if not candidate_exists:
-        missing_policy = (
-            "robots_missing"
-            if status is None or status in {404, 410} or not body_nonempty
-            else "robots_unparseable"
-        )
-        policies = {agent: missing_policy for agent in AI_AGENTS}
-        return {
-            "candidate_exists": False,
-            "valid_text": textual and body_text is not None,
-            "line_count": 0,
-            "user_agent_count": 0,
-            "user_agents": [],
-            "sitemap_count": 0,
-            "sitemaps": [],
-            "groups": [],
-            "parseable": False,
-            "policies": policies,
-            "explicit_agent_mentions": [],
-        }
-
-    groups, sitemaps, parseable = parse_robots_groups(body_text or "")
-    all_agents = sorted(
-        {
-            agent
-            for group in groups
-            for agent in group.get("agents", [])
-            if isinstance(agent, str)
-        }
-    )
-    explicit_mentions = sorted(agent for agent in AI_AGENTS if agent in all_agents)
-
-    if not parseable:
-        policies = {agent: "robots_unparseable" for agent in AI_AGENTS}
-    else:
-        policies = {agent: classify_agent_policy(groups, agent) for agent in AI_AGENTS}
-
-    return {
-        "candidate_exists": candidate_exists,
-        "valid_text": textual and body_text is not None,
-        "line_count": len((body_text or "").splitlines()),
-        "user_agent_count": len(all_agents),
-        "user_agents": all_agents,
-        "sitemap_count": len(sitemaps),
-        "sitemaps": sitemaps,
-        "groups": groups,
-        "parseable": parseable,
-        "policies": policies,
-        "explicit_agent_mentions": explicit_mentions,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Domain orchestration
-# ---------------------------------------------------------------------------
-
-
-def blank_endpoint(
-    url: str | None, error_type: str, error_message: str
-) -> dict[str, Any]:
-    return {
-        "requested_url": url,
-        "final_url": None,
-        "final_host": None,
-        "final_scheme": None,
-        "status_code": None,
-        "content_type": None,
-        "content_type_header": None,
-        "content_length": None,
-        "elapsed_ms": 0,
-        "redirect_count": 0,
-        "redirect_chain": [],
-        "bytes_read": 0,
-        "body_sha256": None,
-        "body_text": None,
-        "body_truncated": False,
-        "attempts": 0,
-        "error_type": error_type,
-        "error_message": error_message,
-    }
-
-
-async def process_domain(
-    item: DomainInput,
-    client: httpx.AsyncClient,
-    semaphore: asyncio.Semaphore,
-    per_domain_concurrency: int,
-) -> dict[str, Any]:
-    fetched_at = utc_now_iso()
-    record: dict[str, Any] = {
-        "schema_version": 2,
-        "input_domain": item.domain,
-        "domain": item.domain,
-        "source_position": item.source_position,
-        "source_rank": item.source_rank,
-        "source_row": item.source_row,
-        "source_domain_value": item.source_domain_value,
-        "source_fields": item.source_fields,
-        "fetched_at": fetched_at,
-        "domain_error": None,
-    }
-
-    try:
-        homepage = await fetch_homepage(client, semaphore, item.domain)
-        record["homepage"] = homepage
-
-        final_host = homepage.get("final_host")
-        final_scheme = homepage.get("final_scheme")
-        if not final_host or not final_scheme:
-            message = "Homepage did not resolve to a final scheme and host."
-            record["robots"] = blank_endpoint(None, "not_attempted", message)
-            record["llms_txt"] = blank_endpoint(None, "not_attempted", message)
-            record["llms_full_txt"] = blank_endpoint(None, "not_attempted", message)
-            record["robots"]["parsed"] = parse_robots_text(record["robots"])
-            record["llms_txt"]["parsed"] = parse_llms_text(record["llms_txt"], homepage)
-            record["llms_full_txt"]["parsed"] = parse_llms_text(
-                record["llms_full_txt"], homepage
-            )
-            record["collection_complete"] = True
-            record["collection_error_count"] = count_record_errors(record)
-            return record
-
-        base = f"{final_scheme}://{final_host}"
-
-        endpoint_specs = {
-            "robots": (f"{base}/robots.txt", FetchSpec(ROBOTS_LIMIT)),
-            "llms_txt": (f"{base}/llms.txt", FetchSpec(LLMS_LIMIT)),
-            "llms_full_txt": (
-                f"{base}/llms-full.txt",
-                FetchSpec(LLMS_FULL_LIMIT),
-            ),
-        }
-
-        domain_semaphore = asyncio.Semaphore(max(1, per_domain_concurrency))
-
-        async def fetch_one(url: str, spec: FetchSpec) -> dict[str, Any]:
-            async with domain_semaphore:
-                return await fetch_response(client, semaphore, url, spec)
-
-        robots, llms_txt, llms_full_txt = await asyncio.gather(
-            *(fetch_one(url, spec) for url, spec in endpoint_specs.values())
-        )
-
-        robots["parsed"] = parse_robots_text(robots)
-        llms_txt["parsed"] = parse_llms_text(llms_txt, homepage)
-        llms_full_txt["parsed"] = parse_llms_text(llms_full_txt, homepage)
-
-        record["robots"] = robots
-        record["llms_txt"] = llms_txt
-        record["llms_full_txt"] = llms_full_txt
-        record["collection_complete"] = True
-        record["collection_error_count"] = count_record_errors(record)
-        return record
-
-    except Exception as exc:
-        error_type, error_message = classify_httpx_error(exc)
-        record["domain_error"] = {
-            "error_type": error_type,
-            "error_message": error_message,
-        }
-        record.setdefault(
-            "homepage",
-            blank_endpoint(f"https://{item.domain}/", error_type, error_message),
-        )
-        final_host = record["homepage"].get("final_host") or item.domain
-        final_scheme = record["homepage"].get("final_scheme") or "https"
-        record.setdefault(
-            "robots",
-            blank_endpoint(
-                f"{final_scheme}://{final_host}/robots.txt",
-                "domain_processing_error",
-                error_message,
-            ),
-        )
-        record.setdefault(
-            "llms_txt",
-            blank_endpoint(
-                f"{final_scheme}://{final_host}/llms.txt",
-                "domain_processing_error",
-                error_message,
-            ),
-        )
-        record.setdefault(
-            "llms_full_txt",
-            blank_endpoint(
-                f"{final_scheme}://{final_host}/llms-full.txt",
-                "domain_processing_error",
-                error_message,
-            ),
-        )
-        record["robots"]["parsed"] = parse_robots_text(record["robots"])
-        record["llms_txt"]["parsed"] = parse_llms_text(
-            record["llms_txt"], record["homepage"]
-        )
-        record["llms_full_txt"]["parsed"] = parse_llms_text(
-            record["llms_full_txt"], record["homepage"]
-        )
-        record["collection_complete"] = False
-        record["collection_error_count"] = count_record_errors(record)
-        return record
-
-
-# ---------------------------------------------------------------------------
-# JSONL, flattening, and exports
-# ---------------------------------------------------------------------------
-
-
-def open_jsonl_text(path: Path, mode: str):
+def open_jsonl_text(path: Path, mode: str) -> TextIO:
     if path.suffix == ".gz":
-        return gzip.open(path, mode + "t", encoding="utf-8")
+        return gzip.open(path, mode + "t", encoding="utf-8")  # type: ignore[return-value]
     return path.open(mode, encoding="utf-8")
 
 
@@ -1267,359 +605,1450 @@ def iter_jsonl(
             )
 
 
-def completed_domains_from_jsonl(path: Path) -> set[str]:
+def completed_domains_from_checkpoint(path: Path) -> set[str]:
     return {
-        str(record.get("domain")) for record in iter_jsonl(path) if record.get("domain")
+        str(record.get("domain"))
+        for record in iter_jsonl(path)
+        if isinstance(record.get("domain"), str)
     }
 
 
-def safe_get(mapping: Mapping[str, Any], *keys: str, default: Any = None) -> Any:
-    current: Any = mapping
-    for key in keys:
-        if not isinstance(current, Mapping):
-            return default
-        current = current.get(key)
-        if current is None:
-            return default
-    return current
+def classify_httpx_error(exc: Exception) -> str:
+    if isinstance(exc, httpx.ConnectTimeout):
+        return "connect_timeout"
+    if isinstance(exc, httpx.ReadTimeout):
+        return "read_timeout"
+    if isinstance(exc, httpx.PoolTimeout):
+        return "pool_timeout"
+    if isinstance(exc, httpx.TooManyRedirects):
+        return "redirect_error"
+    if isinstance(exc, httpx.InvalidURL):
+        return "invalid_url"
+    if isinstance(exc, httpx.ConnectError):
+        cause = exc.__cause__
+        chain = repr(exc).lower()
+        if isinstance(cause, ssl.SSLError) or "certificate" in chain or "tls" in chain:
+            return "tls_error"
+        if isinstance(cause, socket.gaierror) or "name or service not known" in chain:
+            return "dns_error"
+        return "connect_error"
+    if isinstance(exc, httpx.TransportError):
+        return "connect_error"
+    return "connect_error"
 
 
-def endpoint_candidate_value(endpoint: Mapping[str, Any]) -> bool | None:
-    if endpoint.get("status_code") is None:
+def parse_retry_after(value: str | None) -> float | None:
+    if not value:
         return None
-    return bool(safe_get(endpoint, "parsed", "candidate_exists", default=False))
-
-
-def parsed_if_response(endpoint: Mapping[str, Any], field: str) -> Any:
-    if endpoint.get("status_code") is None:
+    stripped = value.strip()
+    if not stripped:
         return None
-    if endpoint.get("body_text") is None:
-        return None
-    if not safe_get(endpoint, "parsed", "valid_text", default=False):
-        return None
-    return safe_get(endpoint, "parsed", field)
-
-
-def flatten_record(record: Mapping[str, Any]) -> dict[str, Any]:
-    homepage = record.get("homepage", {})
-    robots = record.get("robots", {})
-    llms = record.get("llms_txt", {})
-    llms_full = record.get("llms_full_txt", {})
-    policies = safe_get(robots, "parsed", "policies", default={}) or {}
-    source_fields = record.get("source_fields", {})
-    if not isinstance(source_fields, Mapping):
-        source_fields = {}
-
-    flat = {
-        "source_position": record.get("source_position"),
-        "source_rank": record.get("source_rank"),
-        "source_categories": source_fields.get("categories"),
-        "source_domain_value": record.get("source_domain_value"),
-        "input_domain": record.get("input_domain", record.get("domain")),
-        "domain": record.get("domain"),
-        "fetched_at": record.get("fetched_at"),
-        "homepage_requested_url": homepage.get("requested_url"),
-        "homepage_final_url": homepage.get("final_url"),
-        "homepage_final_host": homepage.get("final_host"),
-        "homepage_status": homepage.get("status_code"),
-        "homepage_reachable": homepage.get(
-            "reachable", homepage.get("status_code") is not None
-        ),
-        "homepage_error_type": homepage.get("error_type"),
-        "homepage_error_message": homepage.get("error_message"),
-        "homepage_redirect_count": homepage.get("redirect_count"),
-        "homepage_used_http_fallback": homepage.get("used_http_fallback"),
-        "robots_requested_url": robots.get("requested_url"),
-        "robots_status": robots.get("status_code"),
-        "robots_candidate_exists": endpoint_candidate_value(robots),
-        "robots_content_type": robots.get("content_type"),
-        "robots_line_count": parsed_if_response(robots, "line_count"),
-        "robots_user_agent_count": parsed_if_response(robots, "user_agent_count"),
-        "robots_sitemap_count": parsed_if_response(robots, "sitemap_count"),
-        "robots_error_type": robots.get("error_type"),
-        "robots_error_message": robots.get("error_message"),
-        "llms_txt_requested_url": llms.get("requested_url"),
-        "llms_txt_final_url": llms.get("final_url"),
-        "llms_txt_status": llms.get("status_code"),
-        "llms_txt_candidate_exists": endpoint_candidate_value(llms),
-        "llms_txt_probable_homepage_fallback": safe_get(
-            llms, "parsed", "probable_homepage_fallback"
-        ),
-        "llms_txt_probable_soft_404": safe_get(llms, "parsed", "probable_soft_404"),
-        "llms_txt_probable_unrelated_response": safe_get(
-            llms, "parsed", "probable_unrelated_response"
-        ),
-        "llms_txt_content_type": llms.get("content_type"),
-        "llms_txt_markdown_like": parsed_if_response(llms, "markdown_like"),
-        "llms_txt_title": parsed_if_response(llms, "title"),
-        "llms_txt_word_count": parsed_if_response(llms, "word_count"),
-        "llms_txt_line_count": parsed_if_response(llms, "line_count"),
-        "llms_txt_heading_count": parsed_if_response(llms, "heading_count"),
-        "llms_txt_link_count": parsed_if_response(llms, "link_count"),
-        "llms_txt_same_host_link_count": parsed_if_response(
-            llms, "same_host_link_count"
-        ),
-        "llms_txt_relative_link_count": parsed_if_response(llms, "relative_link_count"),
-        "llms_txt_external_link_count": parsed_if_response(llms, "external_link_count"),
-        "llms_txt_invalid_link_count": parsed_if_response(llms, "invalid_link_count"),
-        "llms_txt_llms_full_reference": safe_get(llms, "parsed", "llms_full_reference"),
-        "llms_txt_error_type": llms.get("error_type"),
-        "llms_txt_error_message": llms.get("error_message"),
-        "llms_full_requested_url": llms_full.get("requested_url"),
-        "llms_full_final_url": llms_full.get("final_url"),
-        "llms_full_status": llms_full.get("status_code"),
-        "llms_full_candidate_exists": endpoint_candidate_value(llms_full),
-        "llms_full_probable_homepage_fallback": safe_get(
-            llms_full, "parsed", "probable_homepage_fallback"
-        ),
-        "llms_full_probable_soft_404": safe_get(
-            llms_full, "parsed", "probable_soft_404"
-        ),
-        "llms_full_probable_unrelated_response": safe_get(
-            llms_full, "parsed", "probable_unrelated_response"
-        ),
-        "llms_full_content_type": llms_full.get("content_type"),
-        "llms_full_markdown_like": parsed_if_response(llms_full, "markdown_like"),
-        "llms_full_word_count": parsed_if_response(llms_full, "word_count"),
-        "llms_full_heading_count": parsed_if_response(llms_full, "heading_count"),
-        "llms_full_link_count": parsed_if_response(llms_full, "link_count"),
-        "llms_full_error_type": llms_full.get("error_type"),
-        "llms_full_error_message": llms_full.get("error_message"),
-        "collection_complete": record.get("collection_complete", False),
-        "collection_error_count": record.get(
-            "collection_error_count", count_record_errors(record)
-        ),
-    }
-
-    for agent in AI_AGENTS:
-        flat[f"{agent.replace('-', '_')}_policy"] = policies.get(
-            agent, "robots_unparseable"
-        )
-    return flat
-
-
-def refresh_record_parsing(record: Mapping[str, Any]) -> dict[str, Any]:
-    refreshed = dict(record)
-    homepage = refreshed.get("homepage", {})
-    if not isinstance(homepage, Mapping):
-        homepage = {}
-
-    robots = dict(refreshed.get("robots", {}) or {})
-    llms = dict(refreshed.get("llms_txt", {}) or {})
-    llms_full = dict(refreshed.get("llms_full_txt", {}) or {})
-
-    robots["parsed"] = parse_robots_text(robots)
-    llms["parsed"] = parse_llms_text(llms, homepage)
-    llms_full["parsed"] = parse_llms_text(llms_full, homepage)
-
-    refreshed["robots"] = robots
-    refreshed["llms_txt"] = llms
-    refreshed["llms_full_txt"] = llms_full
-    refreshed["collection_error_count"] = count_record_errors(refreshed)
-    return refreshed
-
-
-def ordered_fieldnames(rows: Sequence[Mapping[str, Any]]) -> list[str]:
-    if not rows:
-        return []
-    keys: list[str] = list(rows[0].keys())
-    seen = set(keys)
-    for row in rows[1:]:
-        for key in row:
-            if key not in seen:
-                seen.add(key)
-                keys.append(key)
-    return keys
-
-
-def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ordered_fieldnames(rows)
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def parse_utc_timestamp(value: Any) -> datetime | None:
-    if value is None or isinstance(value, datetime):
-        return value
-    if not isinstance(value, str) or not value.strip():
-        return None
+    if stripped.isdigit():
+        return min(float(stripped), MAX_RETRY_AFTER_SECONDS)
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        parsed = email.utils.parsedate_to_datetime(stripped)
+    except (TypeError, ValueError):
         return None
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    seconds = (parsed - datetime.now(timezone.utc)).total_seconds()
+    if seconds <= 0:
+        return 0.0
+    return min(seconds, MAX_RETRY_AFTER_SECONDS)
 
 
-def write_parquet(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
-    try:
-        import pyarrow as pa
-        import pyarrow.parquet as pq
-    except ImportError as exc:
-        raise RuntimeError(
-            "pyarrow is required to write Parquet. Install dependencies with `uv sync`."
-        ) from exc
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fieldnames = ordered_fieldnames(rows)
-    int_columns = {
-        name
-        for name in fieldnames
-        if name.endswith("_count")
-        or name.endswith("_status")
-        or name in {"source_position", "source_rank"}
-    }
-    bool_columns = {
-        name
-        for name in fieldnames
-        if name.endswith("_exists")
-        or name.endswith("_reachable")
-        or name.endswith("_fallback")
-        or name.endswith("_soft_404")
-        or name.endswith("_unrelated_response")
-        or name.endswith("_like")
-        or name.endswith("_reference")
-        or name == "collection_complete"
-    }
-
-    arrays = []
-    fields = []
-    for name in fieldnames:
-        values = [row.get(name) for row in rows]
-        if name == "fetched_at":
-            array = pa.array(
-                [parse_utc_timestamp(value) for value in values],
-                type=pa.timestamp("ms", tz="UTC"),
-            )
-            field_type = array.type
-        elif name in int_columns:
-            array = pa.array(values, type=pa.int64())
-            field_type = array.type
-        elif name in bool_columns:
-            array = pa.array(values, type=pa.bool_())
-            field_type = array.type
-        else:
-            array = pa.array(values, type=pa.string())
-            field_type = array.type
-        arrays.append(array)
-        fields.append(pa.field(name, field_type))
-
-    table = pa.Table.from_arrays(arrays, schema=pa.schema(fields))
-    pq.write_table(table, path, compression="zstd")
-
-
-def rebuild_outputs_from_jsonl(
-    raw_path: Path,
-    parquet_path: Path,
-    csv_path: Path | None,
-) -> list[dict[str, Any]]:
-    rows = [
-        flatten_record(refresh_record_parsing(record))
-        for record in iter_jsonl(raw_path)
-    ]
-    if not rows:
-        logging.warning("No records found in %s. Skipping tabular outputs.", raw_path)
-        return []
-    write_parquet(parquet_path, rows)
-    if csv_path is not None:
-        write_csv(csv_path, rows)
-    return rows
-
-
-def write_run_summary(
-    path: Path,
-    *,
-    input_rows: int,
-    unique_input_domains: int,
-    skipped_rows: Sequence[Mapping[str, Any]],
-    rows: Sequence[Mapping[str, Any]],
-    started_at: str,
-    finished_at: str,
-    elapsed_seconds: float,
-    raw_path: Path,
-) -> None:
-    summary = {
-        "schema_version": 1,
-        "input_rows": input_rows,
-        "unique_input_domains": unique_input_domains,
-        "skipped_input_rows": len(skipped_rows),
-        "processed_domains": len(rows),
-        "homepage_reachable": sum(bool(row.get("homepage_reachable")) for row in rows),
-        "robots_candidates": sum(
-            bool(row.get("robots_candidate_exists")) for row in rows
+def should_retry_exception(exc: Exception) -> bool:
+    return isinstance(
+        exc,
+        (
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.PoolTimeout,
+            httpx.ConnectError,
         ),
-        "llms_txt_candidates": sum(
-            bool(row.get("llms_txt_candidate_exists")) for row in rows
-        ),
-        "llms_full_candidates": sum(
-            bool(row.get("llms_full_candidate_exists")) for row in rows
-        ),
-        "domains_with_errors": sum(
-            int(row.get("collection_error_count") or 0) > 0 for row in rows
-        ),
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "elapsed_seconds": round(elapsed_seconds, 3),
-        "raw_results_path": str(raw_path),
-        "skipped_rows": list(skipped_rows),
-    }
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
     )
 
 
-# ---------------------------------------------------------------------------
-# Main orchestration
-# ---------------------------------------------------------------------------
+def should_try_http_fallback(error: str | None) -> bool:
+    return error in {"connect_timeout", "connect_error", "tls_error"}
+
+
+def is_forbidden_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_unspecified
+        or ip.is_reserved
+    )
+
+
+def validate_literal_ip(host: str) -> str | None:
+    value = host.strip("[]")
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    return "private_address" if is_forbidden_ip(address) else None
+
+
+def resolve_host_safety_sync(host: str) -> str | None:
+    literal_error = validate_literal_ip(host)
+    if literal_error is not None:
+        return literal_error
+    try:
+        results = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return "dns_error"
+    for result in results:
+        address_text = result[4][0]
+        try:
+            address = ipaddress.ip_address(address_text)
+        except ValueError:
+            return "dns_error"
+        if is_forbidden_ip(address):
+            return "private_address"
+    return None
+
+
+async def validate_request_url(url: str) -> str | None:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return "invalid_url"
+    if parsed.username is not None or parsed.password is not None:
+        return "invalid_url"
+    return await asyncio.to_thread(resolve_host_safety_sync, parsed.hostname)
+
+
+async def read_limited(response: httpx.Response, limit: int) -> tuple[bytes, bool]:
+    chunks: list[bytes] = []
+    total = 0
+    truncated = False
+    async for chunk in response.aiter_bytes():
+        if not chunk:
+            continue
+        remaining = limit - total
+        if remaining <= 0:
+            truncated = True
+            break
+        if len(chunk) > remaining:
+            chunks.append(chunk[:remaining])
+            total += remaining
+            truncated = True
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    await response.aclose()
+    return b"".join(chunks), truncated
+
+
+async def fetch_once(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    url: str,
+    limit: int,
+) -> EndpointResult:
+    attempts = 0
+    while attempts <= len(RETRY_DELAYS):
+        attempts += 1
+        current_url = url
+        redirects = 0
+        try:
+            retry_delay: float | None = None
+            while True:
+                safety_error = await validate_request_url(current_url)
+                if safety_error is not None:
+                    return EndpointResult(
+                        requested_url=url,
+                        final_url=current_url,
+                        status=None,
+                        content_type=None,
+                        content_length=None,
+                        bytes_read=0,
+                        body_sample=b"",
+                        truncated=False,
+                        error=safety_error,
+                    )
+
+                async with semaphore:
+                    request = client.build_request("GET", current_url)
+                    response = await client.send(request, stream=True)
+                    status_code = response.status_code
+                    if 300 <= status_code < 400 and response.headers.get("location"):
+                        location = response.headers["location"]
+                        await response.aclose()
+                        redirects += 1
+                        if redirects > DEFAULT_REDIRECT_LIMIT:
+                            return EndpointResult(
+                                requested_url=url,
+                                final_url=current_url,
+                                status=status_code,
+                                content_type=None,
+                                content_length=None,
+                                bytes_read=0,
+                                body_sample=b"",
+                                truncated=False,
+                                error="redirect_error",
+                            )
+                        next_url = urljoin(current_url, location)
+                        parsed_next = urlparse(next_url)
+                        if parsed_next.scheme not in {"http", "https"}:
+                            return EndpointResult(
+                                requested_url=url,
+                                final_url=next_url,
+                                status=status_code,
+                                content_type=None,
+                                content_length=None,
+                                bytes_read=0,
+                                body_sample=b"",
+                                truncated=False,
+                                error="unsafe_redirect",
+                            )
+                        current_url = next_url
+                        continue
+
+                    if status_code in RETRYABLE_STATUS_CODES and attempts <= len(
+                        RETRY_DELAYS
+                    ):
+                        retry_after = parse_retry_after(
+                            response.headers.get("retry-after")
+                        )
+                        await response.aclose()
+                        retry_delay = (
+                            retry_after
+                            if retry_after is not None
+                            else RETRY_DELAYS[attempts - 1] + random.uniform(0.0, 0.3)
+                        )
+                    else:
+                        body, truncated = await read_limited(response, limit)
+                        return EndpointResult(
+                            requested_url=url,
+                            final_url=str(response.url),
+                            status=status_code,
+                            content_type=content_type_base(
+                                response.headers.get("content-type")
+                            ),
+                            content_length=_parse_int(
+                                response.headers.get("content-length")
+                            ),
+                            bytes_read=len(body),
+                            body_sample=body,
+                            truncated=truncated,
+                            error=None,
+                        )
+                if retry_delay is not None:
+                    break
+            if retry_delay is not None:
+                await asyncio.sleep(retry_delay)
+                continue
+        except httpx.HTTPError as exc:
+            error = classify_httpx_error(exc)
+            if attempts <= len(RETRY_DELAYS) and should_retry_exception(exc):
+                delay = RETRY_DELAYS[attempts - 1] + random.uniform(0.0, 0.3)
+                await asyncio.sleep(delay)
+                continue
+            return EndpointResult(
+                requested_url=url,
+                final_url=None,
+                status=None,
+                content_type=None,
+                content_length=None,
+                bytes_read=0,
+                body_sample=b"",
+                truncated=False,
+                error=error,
+            )
+    raise RuntimeError("unreachable retry state")
+
+
+async def fetch_endpoint(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    domain: str,
+    path: str,
+    limit: int,
+) -> EndpointResult:
+    https_result = await fetch_once(client, semaphore, f"https://{domain}{path}", limit)
+    if https_result.status is not None or not should_try_http_fallback(
+        https_result.error
+    ):
+        return https_result
+    http_result = await fetch_once(client, semaphore, f"http://{domain}{path}", limit)
+    return replace(http_result, requested_url=https_result.requested_url)
+
+
+def looks_textual(data: bytes) -> bool:
+    if not data:
+        return True
+    sample = data[:4096]
+    if b"\x00" in sample:
+        return False
+    control = sum(1 for byte in sample if byte < 9 or (13 < byte < 32))
+    return control / max(len(sample), 1) < 0.02
+
+
+def decode_text_sample(
+    data: bytes, content_type_header: str | None = None
+) -> str | None:
+    if not data:
+        return ""
+    if not looks_textual(data):
+        return None
+    charset = None
+    if content_type_header:
+        match = re.search(
+            r"charset\s*=\s*[\"']?([^;\"'\s]+)", content_type_header, re.I
+        )
+        if match:
+            charset = match.group(1).strip().lower()
+    encodings = [charset] if charset else []
+    encodings.extend(["utf-8", "windows-1252", "latin-1"])
+    attempted: set[str] = set()
+    for encoding in encodings:
+        if not encoding or encoding in attempted:
+            continue
+        attempted.add(encoding)
+        try:
+            return data.decode(encoding)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def is_textual_content_type(content_type: str | None) -> bool:
+    if content_type is None:
+        return False
+    return content_type.startswith("text/") or content_type in TEXTUAL_CONTENT_TYPES
+
+
+def looks_like_html(text: str) -> bool:
+    sample = text[:8192].lower()
+    if any(
+        marker in sample for marker in ("<!doctype html", "<html", "<head", "<body")
+    ):
+        return True
+    if re.search(r"<(?:title|div|span|script|style|meta|form|nav|footer)\b", sample):
+        return True
+    if re.search(r"</(?:html|head|body|div|span|script|style|form)>", sample):
+        return True
+    return False
+
+
+def looks_like_html_error(text: str) -> bool:
+    sample = re.sub(r"\s+", " ", text[:20_000]).lower()
+    if not looks_like_html(text):
+        return False
+    return any(re.search(pattern, sample) for pattern in HTML_ERROR_PATTERNS)
+
+
+def controlled_error(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if value in ERROR_VALUES:
+        return value
+    raise ValueError(f"Unexpected endpoint error code: {value}")
+
+
+HEADING_RE = re.compile(r"(?m)^\s{0,3}#{1,6}\s+\S")
+H1_RE = re.compile(r"(?m)^\s{0,3}#\s+\S")
+MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[[^\]\n]+\]\([^) \n]+(?:\s+\"[^\"]*\")?\)")
+AUTOLINK_RE = re.compile(r"<https?://[^>\s]+>")
+
+
+def count_markdown_headings(text: str) -> int:
+    return len(HEADING_RE.findall(text))
+
+
+def count_markdown_links(text: str) -> int:
+    return len(MARKDOWN_LINK_RE.findall(text)) + len(AUTOLINK_RE.findall(text))
+
+
+def has_markdown_h1(text: str) -> bool:
+    return bool(H1_RE.search(text))
+
+
+def evaluate_llms_txt(result: EndpointResult) -> dict[str, Any]:
+    base = {
+        "llms_txt_url": result.requested_url,
+        "llms_txt_final_url": result.final_url,
+        "llms_txt_status": result.status,
+        "llms_txt_bytes_read": result.bytes_read,
+        "llms_txt_content_type": result.content_type,
+        "llms_txt_truncated": result.truncated,
+        "llms_txt_has_h1": False,
+        "llms_txt_heading_count": 0,
+        "llms_txt_link_count": 0,
+        "llms_txt_references_llms_full": False,
+    }
+    if result.error:
+        return {
+            **base,
+            "llms_txt_present": False,
+            "llms_txt_outcome": "network_error",
+            "llms_txt_error": result.error,
+        }
+    if result.status in {404, 410}:
+        return {
+            **base,
+            "llms_txt_present": False,
+            "llms_txt_outcome": "not_found",
+            "llms_txt_error": None,
+        }
+    if result.status != 200:
+        return {
+            **base,
+            "llms_txt_present": False,
+            "llms_txt_outcome": "http_error",
+            "llms_txt_error": None,
+        }
+    if not result.body_sample:
+        return {
+            **base,
+            "llms_txt_present": False,
+            "llms_txt_outcome": "empty",
+            "llms_txt_error": None,
+        }
+
+    text = decode_text_sample(result.body_sample)
+    if text is None:
+        return {
+            **base,
+            "llms_txt_present": False,
+            "llms_txt_outcome": "non_text",
+            "llms_txt_error": "unexpected_binary",
+        }
+    if not text.strip():
+        return {
+            **base,
+            "llms_txt_present": False,
+            "llms_txt_outcome": "empty",
+            "llms_txt_error": None,
+        }
+    if looks_like_html(text) or looks_like_html_error(text):
+        return {
+            **base,
+            "llms_txt_present": False,
+            "llms_txt_outcome": "html_response",
+            "llms_txt_error": None,
+        }
+    if not is_textual_content_type(result.content_type) and not looks_textual(
+        result.body_sample
+    ):
+        return {
+            **base,
+            "llms_txt_present": False,
+            "llms_txt_outcome": "non_text",
+            "llms_txt_error": "unexpected_binary",
+        }
+    heading_count = count_markdown_headings(text)
+    link_count = count_markdown_links(text)
+    return {
+        **base,
+        "llms_txt_present": True,
+        "llms_txt_outcome": "present",
+        "llms_txt_has_h1": has_markdown_h1(text),
+        "llms_txt_heading_count": heading_count,
+        "llms_txt_link_count": link_count,
+        "llms_txt_references_llms_full": "llms-full.txt" in text.lower(),
+        "llms_txt_error": None,
+    }
+
+
+def strip_robots_comment(line: str) -> str:
+    escaped = False
+    for index, char in enumerate(line):
+        if char == "\\" and not escaped:
+            escaped = True
+            continue
+        if char == "#" and not escaped:
+            return line[:index]
+        escaped = False
+    return line
+
+
+def parse_robots_groups(text: str) -> tuple[list[dict[str, Any]], bool]:
+    groups: list[dict[str, Any]] = []
+    current_agents: list[str] = []
+    current_rules: list[dict[str, str]] = []
+    saw_directive = False
+
+    def flush_group() -> None:
+        nonlocal current_agents, current_rules
+        if current_agents:
+            groups.append(
+                {
+                    "agents": list(dict.fromkeys(current_agents)),
+                    "rules": list(current_rules),
+                }
+            )
+        current_agents = []
+        current_rules = []
+
+    for raw_line in text.splitlines():
+        line = strip_robots_comment(raw_line).strip()
+        if not line:
+            if current_agents and current_rules:
+                flush_group()
+            continue
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        key = key.strip().lower()
+        value = value.strip()
+        if key == "user-agent":
+            saw_directive = True
+            if current_agents and current_rules:
+                flush_group()
+            if value:
+                current_agents.append(value.lower())
+        elif key in {"allow", "disallow"}:
+            saw_directive = True
+            if current_agents:
+                current_rules.append({"directive": key, "path": value})
+
+    flush_group()
+    return groups, saw_directive and bool(groups)
+
+
+def classify_rules(rules: Sequence[Mapping[str, str]]) -> str:
+    allows = [
+        str(rule.get("path", "")) for rule in rules if rule.get("directive") == "allow"
+    ]
+    disallows = [
+        str(rule.get("path", ""))
+        for rule in rules
+        if rule.get("directive") == "disallow"
+    ]
+    nonempty_allows = [path for path in allows if path]
+    nonempty_disallows = [path for path in disallows if path]
+    root_disallow = "/" in nonempty_disallows
+
+    if root_disallow and nonempty_allows:
+        return "partial_allow"
+    if root_disallow:
+        return "disallow"
+    if nonempty_disallows and nonempty_allows:
+        return "partial_allow"
+    if nonempty_disallows:
+        return "partial_disallow"
+    if nonempty_allows:
+        return "allow"
+    if disallows:
+        return "allow"
+    return "allow"
+
+
+def classify_agent_policy(
+    groups: Sequence[Mapping[str, Any]], agent: str
+) -> tuple[str, str]:
+    exact_rules: list[Mapping[str, str]] = []
+    wildcard_rules: list[Mapping[str, str]] = []
+    for group in groups:
+        agents = [str(item).lower() for item in group.get("agents", [])]
+        rules = group.get("rules", [])
+        if agent.lower() in agents:
+            exact_rules.extend(rules)
+        elif "*" in agents:
+            wildcard_rules.extend(rules)
+    if exact_rules:
+        return classify_rules(exact_rules), "explicit"
+    if wildcard_rules:
+        return classify_rules(wildcard_rules), "wildcard"
+    return "none", "none"
+
+
+def evaluate_robots_txt(result: EndpointResult) -> dict[str, Any]:
+    base = {
+        "robots_txt_url": result.requested_url,
+        "robots_txt_final_url": result.final_url,
+        "robots_txt_status": result.status,
+        "robots_txt_bytes_read": result.bytes_read,
+        "robots_txt_content_type": result.content_type,
+        "robots_txt_truncated": result.truncated,
+    }
+    error_directives = {column: "error" for column in TRACKED_AGENTS.values()}
+    error_sources = {
+        column.replace("_directive", "_directive_source"): "error"
+        for column in TRACKED_AGENTS.values()
+    }
+    if result.error:
+        return {
+            **base,
+            "robots_txt_present": False,
+            "robots_txt_outcome": "network_error",
+            "robots_txt_error": result.error,
+            **error_directives,
+            **error_sources,
+        }
+    if result.status in {404, 410}:
+        return {
+            **base,
+            "robots_txt_present": False,
+            "robots_txt_outcome": "not_found",
+            "robots_txt_error": None,
+            **error_directives,
+            **error_sources,
+        }
+    if result.status != 200:
+        return {
+            **base,
+            "robots_txt_present": False,
+            "robots_txt_outcome": "http_error",
+            "robots_txt_error": None,
+            **error_directives,
+            **error_sources,
+        }
+    if not result.body_sample:
+        return {
+            **base,
+            "robots_txt_present": False,
+            "robots_txt_outcome": "empty",
+            "robots_txt_error": None,
+            **error_directives,
+            **error_sources,
+        }
+    text = decode_text_sample(result.body_sample)
+    if text is None:
+        return {
+            **base,
+            "robots_txt_present": False,
+            "robots_txt_outcome": "non_text",
+            "robots_txt_error": "unexpected_binary",
+            **error_directives,
+            **error_sources,
+        }
+    if not text.strip():
+        return {
+            **base,
+            "robots_txt_present": False,
+            "robots_txt_outcome": "empty",
+            "robots_txt_error": None,
+            **error_directives,
+            **error_sources,
+        }
+    if looks_like_html(text):
+        return {
+            **base,
+            "robots_txt_present": False,
+            "robots_txt_outcome": "html_response",
+            "robots_txt_error": None,
+            **error_directives,
+            **error_sources,
+        }
+    groups, parseable = parse_robots_groups(text)
+    if not parseable:
+        return {
+            **base,
+            "robots_txt_present": False,
+            "robots_txt_outcome": "parse_error",
+            "robots_txt_error": "parse_error",
+            **error_directives,
+            **error_sources,
+        }
+    directives: dict[str, str] = {}
+    sources: dict[str, str] = {}
+    for agent, column in TRACKED_AGENTS.items():
+        directive, source = classify_agent_policy(groups, agent)
+        directives[column] = directive
+        sources[column.replace("_directive", "_directive_source")] = source
+    return {
+        **base,
+        "robots_txt_present": True,
+        "robots_txt_outcome": "present",
+        "robots_txt_error": None,
+        **directives,
+        **sources,
+    }
+
+
+def compact_row(
+    item: DomainInput,
+    llms_result: EndpointResult,
+    robots_result: EndpointResult,
+    collection_complete: bool = True,
+) -> dict[str, Any]:
+    row: dict[str, Any] = {
+        "rank": item.rank,
+        "domain": item.domain,
+        "categories": item.categories,
+        **evaluate_llms_txt(llms_result),
+        **evaluate_robots_txt(robots_result),
+        "collection_complete": collection_complete,
+    }
+    row["llms_txt_error"] = controlled_error(row.get("llms_txt_error"))
+    row["robots_txt_error"] = controlled_error(row.get("robots_txt_error"))
+    validate_compact_row(row)
+    return row
+
+
+def failed_endpoint(domain: str, path: str, error: str) -> EndpointResult:
+    return EndpointResult(
+        requested_url=f"https://{domain}{path}",
+        final_url=None,
+        status=None,
+        content_type=None,
+        content_length=None,
+        bytes_read=0,
+        body_sample=b"",
+        truncated=False,
+        error=error,
+    )
+
+
+async def process_domain(
+    item: DomainInput,
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+) -> dict[str, Any]:
+    try:
+        llms_result, robots_result = await asyncio.gather(
+            fetch_endpoint(
+                client, semaphore, item.domain, "/llms.txt", LLMS_SAMPLE_LIMIT
+            ),
+            fetch_endpoint(
+                client, semaphore, item.domain, "/robots.txt", ROBOTS_SAMPLE_LIMIT
+            ),
+        )
+        return compact_row(item, llms_result, robots_result, True)
+    except Exception as exc:
+        error = classify_httpx_error(exc)
+        logging.debug("Domain processing failed for %s: %r", item.domain, exc)
+        return compact_row(
+            item,
+            failed_endpoint(item.domain, "/llms.txt", error),
+            failed_endpoint(item.domain, "/robots.txt", error),
+            False,
+        )
+
+
+PARQUET_SCHEMA = pa.schema(
+    [
+        pa.field("rank", pa.int32()),
+        pa.field("domain", pa.string(), nullable=False),
+        pa.field("categories", pa.string()),
+        pa.field("llms_txt_url", pa.string()),
+        pa.field("llms_txt_final_url", pa.string()),
+        pa.field("llms_txt_status", pa.int16()),
+        pa.field("llms_txt_present", pa.bool_(), nullable=False),
+        pa.field("llms_txt_bytes_read", pa.int64(), nullable=False),
+        pa.field("llms_txt_content_type", pa.string()),
+        pa.field(
+            "llms_txt_outcome", pa.dictionary(pa.int8(), pa.string()), nullable=False
+        ),
+        pa.field("llms_txt_truncated", pa.bool_(), nullable=False),
+        pa.field("llms_txt_has_h1", pa.bool_(), nullable=False),
+        pa.field("llms_txt_heading_count", pa.int32(), nullable=False),
+        pa.field("llms_txt_link_count", pa.int32(), nullable=False),
+        pa.field("llms_txt_references_llms_full", pa.bool_(), nullable=False),
+        pa.field("llms_txt_error", pa.dictionary(pa.int8(), pa.string())),
+        pa.field("robots_txt_url", pa.string()),
+        pa.field("robots_txt_final_url", pa.string()),
+        pa.field("robots_txt_status", pa.int16()),
+        pa.field("robots_txt_present", pa.bool_(), nullable=False),
+        pa.field("robots_txt_bytes_read", pa.int64(), nullable=False),
+        pa.field("robots_txt_content_type", pa.string()),
+        pa.field(
+            "robots_txt_outcome", pa.dictionary(pa.int8(), pa.string()), nullable=False
+        ),
+        pa.field("robots_txt_truncated", pa.bool_(), nullable=False),
+        pa.field("robots_txt_error", pa.dictionary(pa.int8(), pa.string())),
+        pa.field(
+            "gptbot_directive", pa.dictionary(pa.int8(), pa.string()), nullable=False
+        ),
+        pa.field(
+            "gptbot_directive_source",
+            pa.dictionary(pa.int8(), pa.string()),
+            nullable=False,
+        ),
+        pa.field(
+            "oai_searchbot_directive",
+            pa.dictionary(pa.int8(), pa.string()),
+            nullable=False,
+        ),
+        pa.field(
+            "oai_searchbot_directive_source",
+            pa.dictionary(pa.int8(), pa.string()),
+            nullable=False,
+        ),
+        pa.field(
+            "claudebot_directive",
+            pa.dictionary(pa.int8(), pa.string()),
+            nullable=False,
+        ),
+        pa.field(
+            "claudebot_directive_source",
+            pa.dictionary(pa.int8(), pa.string()),
+            nullable=False,
+        ),
+        pa.field(
+            "claude_searchbot_directive",
+            pa.dictionary(pa.int8(), pa.string()),
+            nullable=False,
+        ),
+        pa.field(
+            "claude_searchbot_directive_source",
+            pa.dictionary(pa.int8(), pa.string()),
+            nullable=False,
+        ),
+        pa.field(
+            "perplexitybot_directive",
+            pa.dictionary(pa.int8(), pa.string()),
+            nullable=False,
+        ),
+        pa.field(
+            "perplexitybot_directive_source",
+            pa.dictionary(pa.int8(), pa.string()),
+            nullable=False,
+        ),
+        pa.field(
+            "google_extended_directive",
+            pa.dictionary(pa.int8(), pa.string()),
+            nullable=False,
+        ),
+        pa.field(
+            "google_extended_directive_source",
+            pa.dictionary(pa.int8(), pa.string()),
+            nullable=False,
+        ),
+        pa.field("collection_complete", pa.bool_(), nullable=False),
+    ]
+)
+PARQUET_COLUMNS = PARQUET_SCHEMA.names
+CRAWLER_COLUMNS = [
+    column for column in PARQUET_COLUMNS if column.endswith("_directive")
+]
+CRAWLER_SOURCE_COLUMNS = [
+    column for column in PARQUET_COLUMNS if column.endswith("_directive_source")
+]
+LEGACY_REJECTED_COLUMNS = {
+    "source_rank",
+    "source_position",
+    "source_categories",
+    "source_domain_value",
+    "input_domain",
+    "fetched_at",
+    "homepage",
+    "homepage_requested_url",
+    "homepage_final_url",
+    "homepage_reachable",
+    "llms_full_txt",
+    "llms_full_requested_url",
+    "llms_full_final_url",
+    "llms_txt_markdown_like",
+    "gptbot_policy",
+    "oai_searchbot_policy",
+    "chatgpt_user_policy",
+    "claudebot_policy",
+    "claude_searchbot_policy",
+    "google_extended_policy",
+    "ccbot_policy",
+    "perplexitybot_policy",
+}
+
+
+def validate_compact_row(row: Mapping[str, Any]) -> None:
+    keys = set(row)
+    legacy = sorted(keys & LEGACY_REJECTED_COLUMNS)
+    if legacy:
+        raise ValueError(
+            "The existing checkpoint uses an incompatible schema. "
+            f"Legacy fields found: {', '.join(legacy)}. "
+            "Start a clean run with --overwrite."
+        )
+    missing = [name for name in PARQUET_COLUMNS if name not in keys]
+    extra = sorted(keys - set(PARQUET_COLUMNS))
+    if missing or extra:
+        detail = []
+        if missing:
+            detail.append(f"missing fields: {', '.join(missing)}")
+        if extra:
+            detail.append(f"extra fields: {', '.join(extra)}")
+        raise ValueError(
+            "The existing checkpoint uses an incompatible schema. "
+            + "; ".join(detail)
+            + ". Start a clean run with --overwrite."
+        )
+    if not isinstance(row.get("domain"), str) or not row.get("domain"):
+        raise ValueError("Output row has missing domain.")
+    for column in ("llms_txt_outcome", "robots_txt_outcome"):
+        allowed = (
+            LLMS_OUTCOME_VALUES
+            if column == "llms_txt_outcome"
+            else ROBOTS_OUTCOME_VALUES
+        )
+        if row.get(column) not in allowed:
+            raise ValueError(
+                f"Invalid controlled value for {column}: {row.get(column)!r}"
+            )
+    for column in ("llms_txt_error", "robots_txt_error"):
+        value = row.get(column)
+        if value is not None and value not in ERROR_VALUES:
+            raise ValueError(f"Invalid controlled value for {column}: {value!r}")
+    for column in CRAWLER_COLUMNS:
+        if row.get(column) not in DIRECTIVE_VALUES:
+            raise ValueError(
+                f"Invalid controlled value for {column}: {row.get(column)!r}"
+            )
+    for column in CRAWLER_SOURCE_COLUMNS:
+        if row.get(column) not in DIRECTIVE_SOURCE_VALUES:
+            raise ValueError(
+                f"Invalid controlled value for {column}: {row.get(column)!r}"
+            )
+    for column in (
+        "llms_txt_present",
+        "llms_txt_truncated",
+        "llms_txt_has_h1",
+        "llms_txt_references_llms_full",
+        "robots_txt_present",
+        "robots_txt_truncated",
+        "collection_complete",
+    ):
+        if not isinstance(row.get(column), bool):
+            raise ValueError(f"Output row field must be boolean: {column}")
+    for column in (
+        "llms_txt_bytes_read",
+        "llms_txt_heading_count",
+        "llms_txt_link_count",
+        "robots_txt_bytes_read",
+    ):
+        value = row.get(column)
+        if not isinstance(value, int) or value < 0:
+            raise ValueError(
+                f"Output row field must be a non-negative integer: {column}"
+            )
+    if row.get("llms_txt_present") != (row.get("llms_txt_outcome") == "present"):
+        raise ValueError("llms_txt_present must match llms_txt_outcome == 'present'.")
+    if row.get("robots_txt_present") != (row.get("robots_txt_outcome") == "present"):
+        raise ValueError(
+            "robots_txt_present must match robots_txt_outcome == 'present'."
+        )
+
+
+def normalize_row_for_output(row: Mapping[str, Any]) -> dict[str, Any]:
+    normalized = {name: row.get(name) for name in PARQUET_COLUMNS}
+    validate_compact_row(normalized)
+    return normalized
+
+
+def table_from_rows(
+    rows: Sequence[Mapping[str, Any]], schema: pa.Schema = PARQUET_SCHEMA
+) -> pa.Table:
+    columns = {
+        field.name: pa.array(
+            [normalize_row_for_output(row).get(field.name) for row in rows],
+            type=field.type,
+        )
+        for field in schema
+    }
+    return pa.table(columns, schema=schema)
+
+
+def schema_without_metadata(schema: pa.Schema) -> pa.Schema:
+    return pa.schema([schema.field(index) for index in range(len(schema))])
+
+
+def validate_parquet_file(
+    path: Path,
+    *,
+    expected_rows: int,
+    expected_metadata: Mapping[str, Any] | None = None,
+) -> None:
+    parquet_file = pq.ParquetFile(path)
+    actual_schema = schema_without_metadata(parquet_file.schema_arrow)
+    if not actual_schema.equals(PARQUET_SCHEMA, check_metadata=False):
+        raise ValueError("Temporary Parquet schema does not match the V1 contract.")
+    metadata = parquet_file.metadata
+    if metadata.num_columns != len(PARQUET_COLUMNS):
+        raise ValueError("Temporary Parquet has the wrong column count.")
+    if metadata.num_rows != expected_rows:
+        raise ValueError(
+            f"Temporary Parquet has {metadata.num_rows} rows; expected {expected_rows}."
+        )
+    if expected_rows and metadata.num_row_groups < 1:
+        raise ValueError("Temporary Parquet has no row groups.")
+    if expected_metadata:
+        file_metadata = parquet_file.schema_arrow.metadata or {}
+        for key, value in expected_metadata.items():
+            raw = file_metadata.get(key.encode("utf-8"))
+            if raw is None:
+                raise ValueError(f"Temporary Parquet is missing metadata key: {key}")
+            if json.loads(raw.decode("utf-8")) != value:
+                raise ValueError(f"Temporary Parquet metadata mismatch for {key}.")
+
+    table = pq.read_table(path)
+    columns = table.column_names
+    if columns != PARQUET_COLUMNS:
+        raise ValueError("Temporary Parquet columns are not in the expected order.")
+    domains = table.column("domain").to_pylist()
+    if any(domain is None for domain in domains):
+        raise ValueError("Temporary Parquet contains a null domain.")
+    if len(domains) != len(set(domains)):
+        raise ValueError("Temporary Parquet contains duplicate domains.")
+    for forbidden in LEGACY_REJECTED_COLUMNS:
+        if forbidden in columns:
+            raise ValueError(f"Temporary Parquet contains legacy column: {forbidden}")
+    for column, allowed in (
+        ("llms_txt_outcome", LLMS_OUTCOME_VALUES),
+        ("robots_txt_outcome", ROBOTS_OUTCOME_VALUES),
+        ("llms_txt_error", ERROR_VALUES),
+        ("robots_txt_error", ERROR_VALUES),
+    ):
+        values = set(table.column(column).to_pylist()) - {None}
+        invalid = values - allowed
+        if invalid:
+            raise ValueError(
+                f"Invalid controlled values in {column}: {sorted(invalid)}"
+            )
+    for column in CRAWLER_COLUMNS:
+        values = set(table.column(column).to_pylist()) - {None}
+        invalid = values - DIRECTIVE_VALUES
+        if invalid:
+            raise ValueError(f"Invalid directive values in {column}: {sorted(invalid)}")
+    for column in CRAWLER_SOURCE_COLUMNS:
+        values = set(table.column(column).to_pylist()) - {None}
+        invalid = values - DIRECTIVE_SOURCE_VALUES
+        if invalid:
+            raise ValueError(
+                f"Invalid directive-source values in {column}: {sorted(invalid)}"
+            )
+
+
+def iter_unique_checkpoint_rows(path: Path) -> Iterator[dict[str, Any]]:
+    seen: set[str] = set()
+    for raw in iter_jsonl(path):
+        validate_compact_row(raw)
+        domain = raw.get("domain")
+        if not isinstance(domain, str) or not domain:
+            continue
+        if domain in seen:
+            continue
+        seen.add(domain)
+        yield normalize_row_for_output(raw)
+
+
+def write_parquet_from_checkpoint(
+    checkpoint_path: Path,
+    parquet_path: Path,
+    batch_size: int,
+    metadata: Mapping[str, Any] | None = None,
+) -> tuple[int, SummaryCounters]:
+    parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = parquet_path.with_name(f".{parquet_path.name}.tmp")
+    if tmp_path.exists():
+        tmp_path.unlink()
+    schema = (
+        PARQUET_SCHEMA.with_metadata(parquet_metadata_bytes(metadata))
+        if metadata
+        else PARQUET_SCHEMA
+    )
+
+    row_count = 0
+    batch: list[dict[str, Any]] = []
+    counters = SummaryCounters()
+    writer: pq.ParquetWriter | None = None
+    success = False
+    try:
+        writer = pq.ParquetWriter(
+            tmp_path,
+            schema,
+            compression="zstd",
+            use_dictionary=True,
+        )
+        for row in iter_unique_checkpoint_rows(checkpoint_path):
+            batch.append(row)
+            counters.update(row)
+            row_count += 1
+            if len(batch) >= batch_size:
+                writer.write_table(
+                    table_from_rows(batch, schema), row_group_size=batch_size
+                )
+                batch.clear()
+        if batch:
+            writer.write_table(
+                table_from_rows(batch, schema), row_group_size=batch_size
+            )
+            batch.clear()
+        success = True
+    finally:
+        if writer is not None:
+            writer.close()
+        if not success and tmp_path.exists():
+            tmp_path.unlink()
+
+    try:
+        validate_parquet_file(
+            tmp_path, expected_rows=row_count, expected_metadata=metadata
+        )
+    except Exception:
+        logging.exception("Temporary Parquet validation failed: %s", tmp_path)
+        raise
+    os.replace(tmp_path, parquet_path)
+    return row_count, counters
+
+
+def write_csv_from_checkpoint(checkpoint_path: Path, csv_path: Path) -> int:
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = csv_path.with_name(f".{csv_path.name}.tmp")
+    count = 0
+    with tmp_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(
+            handle, fieldnames=PARQUET_COLUMNS, extrasaction="ignore"
+        )
+        writer.writeheader()
+        for row in iter_unique_checkpoint_rows(checkpoint_path):
+            writer.writerow(row)
+            count += 1
+    os.replace(tmp_path, csv_path)
+    return count
+
+
+def output_metadata_path(output_path: Path) -> Path:
+    return output_path.with_name(f"{output_path.name}.metadata.json")
+
+
+def checkpoint_metadata_path(checkpoint_path: Path) -> Path:
+    return checkpoint_path.with_name(f"{checkpoint_path.name}.metadata.json")
+
+
+def checkpoint_metadata(
+    *,
+    input_path: Path,
+    input_digest: str,
+    started_at: str,
+) -> dict[str, Any]:
+    return {
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "output_schema_version": SCHEMA_VERSION,
+        "collector_version": VERSION,
+        "input_filename": input_path.name,
+        "input_sha256": input_digest,
+        "crawler_set_version": CRAWLER_SET_VERSION,
+        "crawler_names": list(TRACKED_AGENTS.keys()),
+        "columns": PARQUET_COLUMNS,
+        "created_at": started_at,
+    }
+
+
+def validate_checkpoint_compatibility(
+    checkpoint_path: Path,
+    metadata_path: Path,
+    *,
+    input_digest: str,
+) -> dict[str, Any]:
+    if not checkpoint_path.exists():
+        raise FileNotFoundError(f"checkpoint does not exist: {checkpoint_path}")
+    if not metadata_path.exists():
+        raise ValueError(
+            "The existing checkpoint uses an incompatible schema. "
+            "Checkpoint metadata is missing. Start a clean run with --overwrite."
+        )
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    expected = {
+        "checkpoint_schema_version": CHECKPOINT_SCHEMA_VERSION,
+        "output_schema_version": SCHEMA_VERSION,
+        "collector_version": VERSION,
+        "input_sha256": input_digest,
+        "crawler_set_version": CRAWLER_SET_VERSION,
+        "crawler_names": list(TRACKED_AGENTS.keys()),
+        "columns": PARQUET_COLUMNS,
+    }
+    mismatches = [key for key, value in expected.items() if metadata.get(key) != value]
+    if mismatches:
+        raise ValueError(
+            "The existing checkpoint uses an incompatible schema. "
+            f"Mismatched metadata: {', '.join(mismatches)}. "
+            "Start a clean run with --overwrite."
+        )
+    for _row in iter_unique_checkpoint_rows(checkpoint_path):
+        pass
+    return metadata
+
+
+def write_output_metadata_sidecar(path: Path, metadata: Mapping[str, Any]) -> None:
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    tmp_path.write_text(
+        json.dumps(metadata, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(tmp_path, path)
+
+
+def build_processed_metadata(
+    *,
+    input_path: Path,
+    input_digest: str,
+    source_dataset: Mapping[str, Any],
+    started_at: str,
+    finished_at: str,
+    output_path: Path,
+    output_row_count: int,
+    counters: SummaryCounters,
+    concurrency: int,
+    domain_workers: int,
+    timeout_config: Mapping[str, float],
+) -> dict[str, Any]:
+    return {
+        "project": {
+            "name": PROJECT_NAME,
+            "repository": "https://github.com/TypeError/ai-web-signals",
+            "collector_version": VERSION,
+            "schema_version": SCHEMA_VERSION,
+            "git_commit": git_commit(),
+        },
+        "source_dataset": {
+            **dict(source_dataset),
+            "input_filename": input_path.name,
+            "input_sha256": input_digest,
+        },
+        "collection": {
+            "started_at": started_at,
+            "finished_at": finished_at,
+            "concurrency": concurrency,
+            "domain_workers": domain_workers,
+            "timeout_config": dict(timeout_config),
+            "endpoint_requests_per_domain_base": 2,
+            "endpoints": ["/llms.txt", "/robots.txt"],
+            "response_size_limits": {
+                "llms_txt_bytes": LLMS_SAMPLE_LIMIT,
+                "robots_txt_bytes": ROBOTS_SAMPLE_LIMIT,
+            },
+            "retry_status_codes": sorted(RETRYABLE_STATUS_CODES),
+            "retry_delays_seconds": list(RETRY_DELAYS),
+            "redirect_limit": DEFAULT_REDIRECT_LIMIT,
+            "http_fallback_policy": (
+                "HTTPS is attempted first. HTTP fallback is used only after "
+                "connect_timeout, connect_error, or tls_error. DNS failures and "
+                "ordinary HTTP responses do not trigger fallback."
+            ),
+        },
+        "processing": {
+            "script": "collection/fetch.py",
+            "processed_at": finished_at,
+            "output_filename": output_path.name,
+            "output_row_count": output_row_count,
+            "normalization": [
+                "Domain values are lowercased, stripped, converted to ASCII IDNA, and deduplicated.",
+                "Rank and categories are preserved when present in the source CSV.",
+                "HTTP response bodies are reduced to compact scalar observations and discarded.",
+            ],
+            "ordering": "Rows are written in collection completion order; use rank or source metadata for analysis ordering.",
+        },
+        "schema": {
+            "columns": PARQUET_COLUMNS,
+            "controlled_vocabularies": {
+                "llms_txt_outcome": sorted(LLMS_OUTCOME_VALUES),
+                "robots_txt_outcome": sorted(ROBOTS_OUTCOME_VALUES),
+                "crawler_directive": sorted(DIRECTIVE_VALUES),
+                "crawler_directive_source": sorted(DIRECTIVE_SOURCE_VALUES),
+            },
+            "crawler_set_version": CRAWLER_SET_VERSION,
+            "crawler_groups": CRAWLER_GROUPS,
+        },
+        "summary_counts": counters.to_json(),
+    }
+
+
+def write_summary(
+    path: Path,
+    *,
+    input_path: Path,
+    input_sha256: str,
+    input_rows: int,
+    unique_input_domains: int,
+    skipped_input_rows: int,
+    duplicate_input_domains: int,
+    skipped_reason_counts: Mapping[str, int],
+    skipped_sample: Sequence[Mapping[str, Any]],
+    counters: SummaryCounters,
+    started_at: str,
+    finished_at: str,
+    elapsed_seconds: float,
+    output_path: Path,
+    output_row_count: int,
+    metadata_path: Path,
+    source_dataset: Mapping[str, Any],
+    checkpoint_path: Path,
+    checkpoint_meta_path: Path,
+    csv_path: Path | None,
+    concurrency: int,
+    domain_workers: int,
+    timeout_config: Mapping[str, float],
+) -> None:
+    parquet_row_groups = (
+        pq.ParquetFile(output_path).metadata.num_row_groups
+        if output_path.exists()
+        else 0
+    )
+    summary = {
+        "schema_version": SCHEMA_VERSION,
+        "collector_version": VERSION,
+        "project_name": PROJECT_NAME,
+        "input_filename": input_path.name,
+        "input_sha256": input_sha256,
+        "source_dataset": dict(source_dataset),
+        "input_rows": input_rows,
+        "unique_input_domains": unique_input_domains,
+        "skipped_input_rows": skipped_input_rows,
+        "duplicate_input_domains": duplicate_input_domains,
+        "skipped_reason_counts": dict(skipped_reason_counts),
+        "skipped_input_sample": list(skipped_sample),
+        **counters.to_json(),
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "elapsed_seconds": round(elapsed_seconds, 3),
+        "concurrency": concurrency,
+        "domain_workers": domain_workers,
+        "timeout_config": dict(timeout_config),
+        "retry_status_codes": sorted(RETRYABLE_STATUS_CODES),
+        "retry_delays_seconds": list(RETRY_DELAYS),
+        "redirect_limit": DEFAULT_REDIRECT_LIMIT,
+        "http_fallback_policy": (
+            "HTTPS is attempted first. HTTP fallback is used only after "
+            "connect_timeout, connect_error, or tls_error. DNS failures and ordinary "
+            "HTTP responses do not trigger fallback."
+        ),
+        "response_size_limits": {
+            "llms_txt_bytes": LLMS_SAMPLE_LIMIT,
+            "robots_txt_bytes": ROBOTS_SAMPLE_LIMIT,
+        },
+        "crawler_set_version": CRAWLER_SET_VERSION,
+        "crawler_groups": CRAWLER_GROUPS,
+        "crawler_names": list(TRACKED_AGENTS.keys()),
+        "output_filename": output_path.name,
+        "output_path": str(output_path),
+        "output_rows": output_row_count,
+        "output_row_count": output_row_count,
+        "output_bytes": output_path.stat().st_size if output_path.exists() else 0,
+        "output_metadata_path": str(metadata_path),
+        "output_metadata_bytes": metadata_path.stat().st_size
+        if metadata_path.exists()
+        else 0,
+        "checkpoint_path": str(checkpoint_path),
+        "checkpoint_bytes": checkpoint_path.stat().st_size
+        if checkpoint_path.exists()
+        else 0,
+        "checkpoint_metadata_path": str(checkpoint_meta_path),
+        "checkpoint_metadata_bytes": checkpoint_meta_path.stat().st_size
+        if checkpoint_meta_path.exists()
+        else 0,
+        "csv_output_path": str(csv_path) if csv_path else None,
+        "parquet_batch_size": DEFAULT_BATCH_SIZE,
+        "parquet_row_groups": parquet_row_groups,
+        "base_endpoint_requests": output_row_count * 2,
+        "actual_request_attempts": None,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    tmp_path.write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    )
+    os.replace(tmp_path, path)
 
 
 async def async_main(args: argparse.Namespace) -> int:
     started_perf = time.perf_counter()
     started_at = utc_now_iso()
+    checkpoint_path: Path = args.checkpoint_output
+    parquet_path: Path = args.processed_output
+    summary_path: Path = args.summary_output
+    csv_path: Path | None = args.csv_output
 
-    raw_path = args.raw_output
-    parquet_path = args.processed_output
-    csv_path = args.csv_output
-    summary_path = args.summary_output
-    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     parquet_path.parent.mkdir(parents=True, exist_ok=True)
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
     if csv_path is not None:
         csv_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
 
-    domains, skipped, input_rows, domain_column, rank_column = load_domains(
-        args.input,
-        args.limit,
-        args.domain_column,
-    )
+    input_digest = file_sha256(args.input)
+    checkpoint_meta_path = checkpoint_metadata_path(checkpoint_path)
+    parquet_tmp_path = parquet_path.with_name(f".{parquet_path.name}.tmp")
+    summary_tmp_path = summary_path.with_name(f".{summary_path.name}.tmp")
 
-    if skipped:
-        logging.warning("Skipped %s input rows.", len(skipped))
-    if not domains:
-        raise ValueError(f"No valid domains found in {args.input}")
-
-    completed: set[str] = set()
-    if args.resume and raw_path.exists():
-        completed = completed_domains_from_jsonl(raw_path)
-        logging.info("Resume enabled. Found %s completed domains.", len(completed))
-    elif raw_path.exists() and not args.resume:
+    if args.resume and args.overwrite:
+        raise ValueError("--resume and --overwrite cannot be used together")
+    if parquet_path.exists() and not args.overwrite:
+        raise FileExistsError(f"{parquet_path} already exists. Use --overwrite.")
+    if csv_path is not None and csv_path.exists() and not args.overwrite:
+        raise FileExistsError(f"{csv_path} already exists. Use --overwrite.")
+    if args.overwrite:
+        for cleanup_path in (
+            checkpoint_path,
+            checkpoint_meta_path,
+            parquet_tmp_path,
+            summary_path,
+            summary_tmp_path,
+            output_metadata_path(parquet_path),
+        ):
+            if cleanup_path.exists():
+                cleanup_path.unlink()
+        if csv_path is not None and csv_path.exists():
+            csv_path.unlink()
+        if (
+            csv_path is None
+            and parquet_path == DEFAULT_PARQUET_PATH
+            and DEFAULT_CSV_PATH.exists()
+        ):
+            DEFAULT_CSV_PATH.unlink()
+            logging.info(
+                "Removed stale legacy CSV during overwrite: %s", DEFAULT_CSV_PATH
+            )
+    if checkpoint_path.exists() and not args.resume:
         if not args.overwrite:
             raise FileExistsError(
-                f"{raw_path} already exists. Use --resume or --overwrite."
+                f"{checkpoint_path} already exists. Use --resume or --overwrite."
             )
-        raw_path.unlink()
+
+    (
+        domains,
+        input_rows,
+        unique_input_domains,
+        skipped_count,
+        duplicate_count,
+        skip_reasons,
+        skipped_sample,
+        domain_column,
+        rank_column,
+        categories_column,
+    ) = load_domains(args.input, args.limit, args.domain_column)
+    if not domains:
+        raise ValueError(f"No valid domains found in {args.input}")
+    input_manifest = load_input_manifest()
+    source_dataset = source_metadata_for_input(args.input, input_digest, input_manifest)
+
+    completed: set[str] = set()
+    if args.resume and checkpoint_path.exists():
+        validate_checkpoint_compatibility(
+            checkpoint_path, checkpoint_meta_path, input_digest=input_digest
+        )
+        completed = completed_domains_from_checkpoint(checkpoint_path)
+        logging.info("Resume enabled. Found %s completed domains.", len(completed))
+    elif args.resume:
+        raise FileNotFoundError(f"{checkpoint_path} does not exist; cannot resume.")
+    else:
+        write_output_metadata_sidecar(
+            checkpoint_meta_path,
+            checkpoint_metadata(
+                input_path=args.input,
+                input_digest=input_digest,
+                started_at=started_at,
+            ),
+        )
 
     pending = [item for item in domains if item.domain not in completed]
     logging.info(
-        "Accepted %s unique domains. Pending %s. Concurrency %s.",
+        "Accepted %s unique domains. Pending %s. Concurrency %s. Batch size %s.",
         len(domains),
         len(pending),
         args.concurrency,
+        DEFAULT_BATCH_SIZE,
     )
+    timeout_config = {
+        "connect": args.connect_timeout,
+        "read": args.read_timeout,
+        "write": args.write_timeout,
+        "pool": args.pool_timeout,
+    }
 
     timeout = httpx.Timeout(
         connect=args.connect_timeout,
@@ -1632,143 +2061,191 @@ async def async_main(args: argparse.Namespace) -> int:
         max_keepalive_connections=max(args.concurrency, 20),
     )
     semaphore = asyncio.Semaphore(args.concurrency)
-    stats = RunStats()
+    stats = SummaryCounters()
     last_progress_at = time.monotonic()
 
     async with httpx.AsyncClient(
-        follow_redirects=True,
+        follow_redirects=False,
         http2=True,
         verify=True,
         timeout=timeout,
         limits=limits,
-        headers={
-            "User-Agent": args.user_agent,
-            "Accept": "*/*",
-        },
+        headers={"User-Agent": args.user_agent, "Accept": "*/*"},
     ) as client:
-        queue: asyncio.Queue[DomainInput | None] = asyncio.Queue()
-        result_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        worker_count = min(args.domain_workers, len(pending)) if pending else 0
+        input_queue: asyncio.Queue[DomainInput | None] = asyncio.Queue(
+            maxsize=max(worker_count * 2, 1)
+        )
+        result_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+            maxsize=max(worker_count * 2, 1)
+        )
 
-        for item in pending:
-            queue.put_nowait(item)
-
-        domain_workers = args.domain_workers or args.concurrency
-        worker_count = min(domain_workers, len(pending)) if pending else 0
-        for _ in range(worker_count):
-            queue.put_nowait(None)
+        async def producer() -> None:
+            for item in pending:
+                await input_queue.put(item)
+            for _ in range(worker_count):
+                await input_queue.put(None)
 
         async def worker() -> None:
             while True:
-                item = await queue.get()
+                item = await input_queue.get()
                 try:
                     if item is None:
                         return
-                    record = await process_domain(
-                        item,
-                        client,
-                        semaphore,
-                        args.per_domain_concurrency,
-                    )
-                    await result_queue.put(record)
+                    row = await process_domain(item, client, semaphore)
+                    await result_queue.put(row)
                 finally:
-                    queue.task_done()
+                    input_queue.task_done()
 
+        producer_task = asyncio.create_task(producer()) if pending else None
         workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
 
         if pending:
-            with open_jsonl_text(raw_path, "a") as raw_handle:
+            with open_jsonl_text(checkpoint_path, "a") as checkpoint_handle:
                 for index in range(len(pending)):
-                    record = await result_queue.get()
-                    write_jsonl_record(raw_handle, record)
-                    stats.update(record)
+                    row = await result_queue.get()
+                    write_jsonl_record(checkpoint_handle, row)
+                    stats.update(row)
                     result_queue.task_done()
 
                     now = time.monotonic()
                     if (
-                        stats.processed % args.log_every == 0
+                        stats.processed_domains % args.log_every == 0
                         or now - last_progress_at >= args.progress_seconds
                         or index + 1 == len(pending)
                     ):
-                        total_done = len(completed) + stats.processed
+                        total_done = len(completed) + stats.processed_domains
                         logging.info(
-                            "Processed %s / %s domains | homepage reachable: %s | "
-                            "robots candidates: %s | llms.txt candidates: %s | errors: %s",
+                            "Processed %s / %s domains | llms.txt present: %s | "
+                            "robots.txt present: %s | errors: %s",
                             total_done,
                             len(domains),
-                            stats.homepage_reachable,
-                            stats.robots_candidates,
-                            stats.llms_candidates,
-                            stats.domains_with_errors,
+                            stats.llms_txt_present,
+                            stats.robots_txt_present,
+                            stats.domains_with_endpoint_errors,
                         )
                         last_progress_at = now
 
-        await queue.join()
+        await input_queue.join()
+        await result_queue.join()
+        if producer_task is not None:
+            await producer_task
         await asyncio.gather(*workers)
 
-    rows = rebuild_outputs_from_jsonl(raw_path, parquet_path, csv_path)
     finished_at = utc_now_iso()
+    parquet_schema_metadata = {
+        "project_name": PROJECT_NAME,
+        "ai_web_signals_schema_version": SCHEMA_VERSION,
+        "collector_version": VERSION,
+        "input_filename": args.input.name,
+        "input_sha256": input_digest,
+        "source_name": source_dataset.get("source_name", SOURCE_NAME),
+        "source_url": source_dataset.get("source_url", SOURCE_URL),
+        "source_license": source_dataset.get("license", SOURCE_LICENSE),
+        "source_license_url": source_dataset.get("license_url", SOURCE_LICENSE_URL),
+        "collection_started_at": started_at,
+        "collection_finished_at": finished_at,
+        "crawler_set_version": CRAWLER_SET_VERSION,
+        "generating_script": "collection/fetch.py",
+    }
+    row_count, final_counters = write_parquet_from_checkpoint(
+        checkpoint_path,
+        parquet_path,
+        DEFAULT_BATCH_SIZE,
+        metadata=parquet_schema_metadata,
+    )
+    if csv_path is not None:
+        write_csv_from_checkpoint(checkpoint_path, csv_path)
+
     elapsed = time.perf_counter() - started_perf
-    write_run_summary(
+    metadata_path = output_metadata_path(parquet_path)
+    processed_metadata = build_processed_metadata(
+        input_path=args.input,
+        input_digest=input_digest,
+        source_dataset=source_dataset,
+        started_at=started_at,
+        finished_at=finished_at,
+        output_path=parquet_path,
+        output_row_count=row_count,
+        counters=final_counters,
+        concurrency=args.concurrency,
+        domain_workers=args.domain_workers,
+        timeout_config=timeout_config,
+    )
+    write_output_metadata_sidecar(metadata_path, processed_metadata)
+    write_summary(
         summary_path,
+        input_path=args.input,
+        input_sha256=input_digest,
         input_rows=input_rows,
-        unique_input_domains=len(domains),
-        skipped_rows=skipped,
-        rows=rows,
+        unique_input_domains=unique_input_domains,
+        skipped_input_rows=skipped_count,
+        duplicate_input_domains=duplicate_count,
+        skipped_reason_counts=skip_reasons,
+        skipped_sample=skipped_sample,
+        counters=final_counters,
         started_at=started_at,
         finished_at=finished_at,
         elapsed_seconds=elapsed,
-        raw_path=raw_path,
+        output_path=parquet_path,
+        output_row_count=row_count,
+        metadata_path=metadata_path,
+        source_dataset=source_dataset,
+        checkpoint_path=checkpoint_path,
+        checkpoint_meta_path=checkpoint_meta_path,
+        csv_path=csv_path,
+        concurrency=args.concurrency,
+        domain_workers=args.domain_workers,
+        timeout_config=timeout_config,
     )
 
-    if skipped:
-        logging.warning("Skipped rows:")
-        for item in skipped:
-            logging.warning(
-                "  row=%s domain=%r reason=%s",
-                item["row"],
-                item["domain"],
-                item["reason"],
-            )
-
-    logging.info("Wrote %s", raw_path)
-    logging.info("Wrote %s", parquet_path)
+    logging.info("Wrote %s rows to %s", row_count, parquet_path)
+    logging.info("Wrote compact checkpoint %s", checkpoint_path)
     if csv_path is not None:
-        logging.info("Wrote %s", csv_path)
+        logging.info("Wrote opt-in CSV %s", csv_path)
     logging.info("Wrote %s", summary_path)
     logging.info(
-        "Input columns: domain=%s rank=%s",
+        "Input columns: domain=%s rank=%s categories=%s",
         domain_column,
         rank_column or "(none)",
+        categories_column or "(none)",
     )
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Fetch and parse robots.txt, llms.txt, and llms-full.txt."
+        description=(
+            "Fetch compact V1 /llms.txt and /robots.txt signals into Parquet. "
+            "CSV and response bodies are not written by default."
+        )
     )
     parser.add_argument(
-        "input",
+        "input", type=Path, help="Path to the input CSV containing domains."
+    )
+    parser.add_argument(
+        "--checkpoint-output",
         type=Path,
-        help="Path to the input CSV containing domains.",
+        default=DEFAULT_CHECKPOINT_PATH,
+        help="Compact JSONL checkpoint used for resume; contains no response bodies.",
     )
     parser.add_argument(
         "--raw-output",
         type=Path,
-        default=DEFAULT_RAW_PATH,
-        help="Raw compressed JSONL output path.",
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--processed-output",
         type=Path,
         default=DEFAULT_PARQUET_PATH,
-        help="Processed Parquet output path.",
+        help="Primary processed Parquet output path.",
     )
     parser.add_argument(
         "--csv-output",
         type=Path,
-        default=DEFAULT_CSV_PATH,
-        help="Optional processed CSV output path.",
+        default=None,
+        help="Optional CSV output path. No CSV is written by default.",
     )
     parser.add_argument(
         "--summary-output",
@@ -1784,11 +2261,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--domain-workers",
         type=int,
-        default=None,
-        help="Number of domain workers. Defaults to --concurrency.",
-    )
-    parser.add_argument(
-        "--per-domain-concurrency", type=int, default=DEFAULT_DOMAIN_CONCURRENCY
+        default=DEFAULT_DOMAIN_WORKERS,
+        help="Number of active domain workers.",
     )
     parser.add_argument("--log-every", type=int, default=DEFAULT_LOG_EVERY)
     parser.add_argument(
@@ -1807,16 +2281,14 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
-
+def validate_args(parser: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    if args.raw_output is not None:
+        args.checkpoint_output = args.raw_output
+        logging.warning("--raw-output is deprecated; use --checkpoint-output.")
     if args.concurrency < 1:
         parser.error("--concurrency must be at least 1")
-    if args.domain_workers is not None and args.domain_workers < 1:
+    if args.domain_workers < 1:
         parser.error("--domain-workers must be at least 1")
-    if args.per_domain_concurrency < 1:
-        parser.error("--per-domain-concurrency must be at least 1")
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
     if args.resume and args.overwrite:
@@ -1838,6 +2310,12 @@ def main() -> int:
     if not args.input.is_file():
         parser.error(f"input path is not a file: {args.input}")
 
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    validate_args(parser, args)
+
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(asctime)s %(levelname)s %(message)s",
@@ -1847,7 +2325,7 @@ def main() -> int:
     try:
         return asyncio.run(async_main(args))
     except KeyboardInterrupt:
-        logging.warning("Interrupted. Completed JSONL records remain resumable.")
+        logging.warning("Interrupted. Compact checkpoint records remain resumable.")
         return 130
     except Exception as exc:
         logging.exception("Fatal error: %s", exc)
