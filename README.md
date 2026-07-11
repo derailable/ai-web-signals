@@ -1,197 +1,223 @@
 # ai-web-signals
 
-`ai-web-signals` measures public AI discovery and crawler-access signals across
-popular domains.
+`ai-web-signals` measures a small set of public signals showing how popular
+websites are adapting to AI discovery and crawler access.
 
-The study asks three narrow questions:
+The V1 study asks:
 
-1. Does a domain publish a plausible `/llms.txt` file?
-2. What policy does `/robots.txt` expose for major AI crawlers?
-3. How do those signals vary across the Cloudflare Radar domain population?
+1. Does the domain publish a plausible `/llms.txt` file?
+2. Does `/robots.txt` restrict major AI training crawlers?
+3. Does `/robots.txt` restrict major AI search crawlers?
+4. Are those policies written specifically for AI crawlers or inherited from
+   `User-agent: *`?
 
-This is not a complete measure of AI readiness, internal AI adoption, search
-visibility, crawler behavior, or provider intent.
+This is a measurement of public web signals. It is not a complete measure of AI
+adoption, internal AI use, search visibility, crawler behavior, or provider
+intent.
 
-Python performs collection and deterministic parsing. R performs analysis,
-visualization, and interpretation.
+Python performs collection and deterministic parsing. R can be used for
+analysis, visualization, and reporting.
 
 ## Data source
 
 The domain population comes from
 [Cloudflare Radar Domain Rankings](https://radar.cloudflare.com/domains).
 
-Cloudflare publishes:
+For the current study, download the Top 100,000 domains CSV from Cloudflare
+Radar and save the original file under `data/input/`. Include the download date
+or date range in the filename.
 
-- an ordered Top 100 list that is updated daily
-- larger global top-N buckets that are updated weekly and are **unordered**
-
-Use the Top 10,000 bucket for this study. Do not infer rank from CSV row order.
-Only use `rank` when the source file contains an explicit rank field.
-
-### Download the input CSV
-
-1. Open <https://radar.cloudflare.com/domains>.
-2. Find **Domain popularity worldwide**.
-3. Open the chart's **More actions** menu and download the CSV.
-4. Select the **Top 10,000** dataset.
-5. Save the original file under `data/input/`, including the download date in
-   the filename.
-
-Recommended filename:
+Example:
 
 ```text
-data/input/cloudflare-radar_top-10000-domains_YYYYMMDD-YYYYMMDD.csv
+data/input/cloudflare-radar_top-100000-domains_YYYYMMDD-YYYYMMDD.csv
 ```
 
-Keep the downloaded file unchanged. The collector normalizes and deduplicates
-`domain` values and preserves `rank` and `categories` when present.
+Keep the source file unchanged for provenance and reproducibility.
+
+### Expected input
+
+The collector accepts a CSV with these columns:
+
+| Column       | Required | Behavior |
+| ------------ | -------- | -------- |
+| `domain`     | Yes      | Normalized, validated, and deduplicated |
+| `rank`       | No       | Preserved when it contains an integer |
+| `categories` | No       | Preserved verbatim from the input |
+
+`hostname` or `host` can be used instead of `domain`. `ranking` can be used
+instead of `rank`, and `category` can be used instead of `categories`.
+
+Multiple category labels remain in the original field. For example:
+
+```csv
+rank,domain,categories
+2,googleapis.com,Information Technology;Content Servers
+9,googlevideo.com,Search Engines;Video Streaming
+```
+
+The collector does not select a primary category or split category values.
 
 ## Collect the data
 
-Set the input path once:
+The only runtime dependency is `httpx`.
+
+Set the input path:
 
 ```bash
-INPUT=data/input/cloudflare-radar_top-10000-domains_YYYYMMDD-YYYYMMDD.csv
+INPUT=data/input/cloudflare-radar_top-100000-domains_YYYYMMDD-YYYYMMDD.csv
 ```
 
-Run a small validation sample before the full collection:
+Run a small sample:
 
 ```bash
-uv run python collection/fetch.py "$INPUT" \
-  --limit 100 \
-  --processed-output /tmp/ai-web-signals/domains.parquet \
-  --checkpoint-output /tmp/ai-web-signals/domains_checkpoint.jsonl \
-  --summary-output /tmp/ai-web-signals/run_summary.json \
-  --overwrite
+uv run python collection/fetch.py "$INPUT" --limit 100 --fresh
 ```
 
 Run the full collection:
 
 ```bash
-uv run python collection/fetch.py "$INPUT" --overwrite
+uv run python collection/fetch.py "$INPUT"
 ```
 
-Parquet is the primary analysis format. Generate CSV only for small manual
-inspection:
+The collector resumes automatically. Domains with a complete prior result are
+skipped. Partial and failed rows are retried when the same command is run again.
+
+Use `--fresh` only when you intend to delete the existing checkpoint and start
+the collection again:
 
 ```bash
-uv run python collection/fetch.py "$INPUT" \
-  --overwrite \
-  --csv-output data/processed/domains.csv
+uv run python collection/fetch.py "$INPUT" --fresh
 ```
 
-The collector requests only:
+A checkpoint is tied to the input file contents and output schema. If either
+changes, start a new run with `--fresh`.
+
+## Collection scope
+
+For each domain, the collector requests only:
 
 ```text
 /llms.txt
 /robots.txt
 ```
 
-It does not fetch homepages, `/llms-full.txt`, sitemaps, manifests, or links
-found in `llms.txt`.
+It does not request the homepage, `/llms-full.txt`, sitemaps, manifests, or
+links found in either file.
+
+The collector uses HTTPS first, follows validated redirects, and falls back to
+HTTP only after selected connection or TLS failures. Response bodies are
+sampled rather than downloaded without a limit.
 
 ## Data artifacts
 
-Primary analysis artifact:
+Analysis-ready output:
 
 ```text
-data/processed/domains.parquet
+data/processed/domains.csv
 ```
 
-Operational artifacts:
+Automatic checkpoint files:
 
 ```text
 data/raw/domains_checkpoint.jsonl
-data/raw/domains_checkpoint.jsonl.metadata.json
-data/raw/run_summary.json
-data/processed/domains.parquet.metadata.json
+data/raw/domains_checkpoint.meta.json
 ```
 
-Generated raw and processed files should be reproducible and normally should
-not be committed.
+Generated raw and processed files are reproducible and normally should not be
+committed.
 
-## Analysis variables
+## Output schema
 
-The Parquet file contains one row per normalized domain and retains four groups
-of variables:
+The output CSV contains one row per normalized domain and eight columns:
 
-| Group             | Main variables                                                                                                                          |
-| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------- |
-| Source            | `rank`, `domain`, `categories`                                                                                                          |
-| `/llms.txt`       | URL, HTTP status, outcome, presence, content type, bytes read, truncation, H1, heading count, link count, and `llms-full.txt` reference |
-| `/robots.txt`     | URL, HTTP status, outcome, presence, content type, bytes read, truncation, and parse error                                              |
-| AI crawler policy | Directive and directive source for GPTBot, OAI-SearchBot, ClaudeBot, Claude-SearchBot, PerplexityBot, and Google-Extended               |
+| Column                  | Values | Meaning |
+| ----------------------- | ------ | ------- |
+| `rank`                  | integer or blank | Rank copied from the input when available |
+| `domain`                | text | Normalized domain |
+| `categories`            | text or blank | Category value copied verbatim from the input |
+| `has_llms_txt`          | `true`, `false`, or blank | Whether a plausible public `/llms.txt` was observed |
+| `training_bots_blocked` | `none`, `some`, `all`, `unknown` | How many tracked training bots have restrictive rules |
+| `search_bots_blocked`   | `none`, `some`, `all`, `unknown` | How many tracked AI search bots have restrictive rules |
+| `ai_policy_explicit`    | `true`, `false`, or blank | Whether an exact tracked AI user-agent group appears in `robots.txt` |
+| `scan_status`           | `complete`, `partial`, `failed` | Whether both endpoint results could be classified |
 
-Crawler directives use these values:
+Blank boolean values mean the result could not be determined. They are not the
+same as `false`.
+
+The blocking summaries count both full and partial restrictions. Therefore,
+`all` means every tracked bot has some restrictive rule. It does not
+necessarily mean every bot is completely blocked from the entire site.
+
+### Tracked training bots
 
 ```text
-allow
-partial_allow
-partial_disallow
-disallow
-none
-error
+GPTBot
+ClaudeBot
+Google-Extended
+Applebot-Extended
+Meta-ExternalAgent
 ```
 
-Directive sources use:
+### Tracked AI search bots
 
 ```text
-explicit
-wildcard
-none
-error
+OAI-SearchBot
+Claude-SearchBot
+PerplexityBot
 ```
 
-`explicit` means an exact crawler user-agent group supplied the policy.
-`wildcard` means the policy was inherited from `User-agent: *`.
-`none` means no applicable rule was found. `error` means the robots response
-could not be classified.
-
-Use `*_outcome` and `collection_complete` as data-quality variables. Do not
-analyze only the convenience booleans such as `llms_txt_present`.
+A wildcard `User-agent: *` policy can affect the blocking summaries. However,
+`ai_policy_explicit` is `true` only when `robots.txt` contains an exact group
+for at least one tracked AI crawler.
 
 ## Analyze in R
 
-Load the compact dataset directly:
+Load the CSV directly:
 
 ```r
-library(arrow)
+library(readr)
 library(dplyr)
 
-domains <- read_parquet("data/processed/domains.parquet")
+domains <- read_csv(
+  "data/processed/domains.csv",
+  na = "",
+  show_col_types = FALSE
+)
 
 domains |>
   summarise(
     domains = n(),
-    complete = mean(collection_complete),
-    llms_txt_adoption = mean(llms_txt_present),
-    robots_txt_available = mean(robots_txt_present)
+    complete = sum(scan_status == "complete"),
+    llms_txt_present = sum(has_llms_txt %in% TRUE),
+    llms_txt_rate_among_known = mean(has_llms_txt, na.rm = TRUE)
   )
 ```
 
-Expand categories during analysis rather than collection:
+Expand semicolon-delimited categories only when an analysis needs one row per
+category:
 
 ```r
 library(tidyr)
 
 categories <- domains |>
-  select(domain, categories, llms_txt_present) |>
-  separate_longer_delim(categories, delim = ";")
+  select(domain, categories, has_llms_txt) |>
+  separate_longer_delim(categories, delim = ";") |>
+  mutate(categories = trimws(categories))
 ```
-
-For larger exploratory queries, use `open_dataset()` to select columns before
-collecting them into memory.
 
 ## Interpretation constraints
 
-- The Top 10,000 file is an unordered membership bucket, not a precise ranking.
-- `llms_txt_present` means a plausible public file was observed. It does not
-  measure quality, usefulness, or adoption by AI systems.
-- `none` is a valid crawler-policy result. It is not equivalent to `error`.
-- Network and HTTP failures are measurement outcomes and should remain visible
-  in denominators and sensitivity checks.
-- Category values may contain multiple semicolon-delimited labels and should be
-  expanded only when the analysis requires it.
+- Treat `scan_status` as a data-quality field and report unknown results.
+- Do not treat a blank boolean as `false`.
+- `has_llms_txt` measures whether a plausible public file was observed. It does
+  not measure the file's quality, usefulness, or adoption by AI systems.
+- `training_bots_blocked` and `search_bots_blocked` summarize restrictive
+  rules. They do not prove that crawlers honor those rules.
+- `ai_policy_explicit = false` can still coexist with restrictions inherited
+  from `User-agent: *`.
+- Preserve `categories` as source data during collection. Split or normalize it
+  only in analysis.
 
 ## Provenance, license, and citation
 
