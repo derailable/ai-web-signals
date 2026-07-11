@@ -8,8 +8,9 @@ The V1 study asks:
 1. Does the domain publish a plausible `/llms.txt` file?
 2. Does `/robots.txt` restrict major AI training crawlers?
 3. Does `/robots.txt` restrict major AI search crawlers?
-4. Are those policies written specifically for AI crawlers or inherited from
-   `User-agent: *`?
+4. Does `/robots.txt` restrict user-triggered AI fetch agents?
+5. Are those policies written specifically for tracked AI agents or inherited
+   from `User-agent: *`?
 
 This is a measurement of public web signals. It is not a complete measure of AI
 adoption, internal AI use, search visibility, crawler behavior, or provider
@@ -39,11 +40,11 @@ Keep the source file unchanged for provenance and reproducibility.
 
 The collector accepts a CSV with these columns:
 
-| Column       | Required | Behavior |
-| ------------ | -------- | -------- |
+| Column       | Required | Behavior                                |
+| ------------ | -------- | --------------------------------------- |
 | `domain`     | Yes      | Normalized, validated, and deduplicated |
-| `rank`       | No       | Preserved when it contains an integer |
-| `categories` | No       | Preserved verbatim from the input |
+| `rank`       | No       | Preserved when it contains an integer   |
+| `categories` | No       | Preserved verbatim from the input       |
 
 `hostname` or `host` can be used instead of `domain`. `ranking` can be used
 instead of `rank`, and `category` can be used instead of `categories`.
@@ -129,18 +130,19 @@ committed.
 
 ## Output schema
 
-The output CSV contains one row per normalized domain and eight columns:
+The output CSV contains one row per normalized domain and nine columns:
 
-| Column                  | Values | Meaning |
-| ----------------------- | ------ | ------- |
-| `rank`                  | integer or blank | Rank copied from the input when available |
-| `domain`                | text | Normalized domain |
-| `categories`            | text or blank | Category value copied verbatim from the input |
-| `has_llms_txt`          | `true`, `false`, or blank | Whether a plausible public `/llms.txt` was observed |
-| `training_bots_blocked` | `none`, `some`, `all`, `unknown` | How many tracked training bots have restrictive rules |
-| `search_bots_blocked`   | `none`, `some`, `all`, `unknown` | How many tracked AI search bots have restrictive rules |
-| `ai_policy_explicit`    | `true`, `false`, or blank | Whether an exact tracked AI user-agent group appears in `robots.txt` |
-| `scan_status`           | `complete`, `partial`, `failed` | Whether both endpoint results could be classified |
+| Column                    | Values                           | Meaning                                                                |
+| ------------------------- | -------------------------------- | ---------------------------------------------------------------------- |
+| `rank`                    | integer or blank                 | Rank copied from the input when available                              |
+| `domain`                  | text                             | Normalized domain                                                      |
+| `categories`              | text or blank                    | Category value copied verbatim from the input                          |
+| `has_llms_txt`            | `true`, `false`, or blank        | Whether a plausible public `/llms.txt` was observed                    |
+| `training_bots_blocked`   | `none`, `some`, `all`, `unknown` | How many tracked training bots have restrictive rules                  |
+| `search_bots_blocked`     | `none`, `some`, `all`, `unknown` | How many tracked AI search bots have restrictive rules                 |
+| `user_fetch_bots_blocked` | `none`, `some`, `all`, `unknown` | How many tracked user-triggered AI fetch agents have restrictive rules |
+| `policy_explicit`         | `true`, `false`, or blank        | Whether an exact tracked AI user-agent group appears in `robots.txt`   |
+| `scan_status`             | `complete`, `partial`, `failed`  | Whether both endpoint results could be classified                      |
 
 Blank boolean values mean the result could not be determined. They are not the
 same as `false`.
@@ -165,11 +167,25 @@ Meta-ExternalAgent
 OAI-SearchBot
 Claude-SearchBot
 PerplexityBot
+DuckAssistBot
+MistralAI-Index
 ```
 
-A wildcard `User-agent: *` policy can affect the blocking summaries. However,
-`ai_policy_explicit` is `true` only when `robots.txt` contains an exact group
-for at least one tracked AI crawler.
+### Tracked user-fetch agents
+
+```text
+ChatGPT-User
+Claude-User
+Perplexity-User
+MistralAI-User
+```
+
+User-fetch agents represent retrieval initiated on behalf of a user. They are
+reported separately from automated training and AI search crawlers.
+
+A wildcard `User-agent: *` policy can affect all three blocking summaries.
+However, `policy_explicit` is `true` only when `robots.txt` contains an exact
+group for at least one tracked AI agent.
 
 ## Analyze in R
 
@@ -212,10 +228,14 @@ categories <- domains |>
 - Do not treat a blank boolean as `false`.
 - `has_llms_txt` measures whether a plausible public file was observed. It does
   not measure the file's quality, usefulness, or adoption by AI systems.
-- `training_bots_blocked` and `search_bots_blocked` summarize restrictive
-  rules. They do not prove that crawlers honor those rules.
-- `ai_policy_explicit = false` can still coexist with restrictions inherited
-  from `User-agent: *`.
+- `training_bots_blocked`, `search_bots_blocked`, and
+  `user_fetch_bots_blocked` summarize restrictive rules. They do not prove
+  that providers honor those rules.
+- `user_fetch_bots_blocked` measures declared access policy for user-triggered
+  retrieval. It does not prove whether a provider will or will not fetch a page
+  in response to a user request.
+- `policy_explicit = false` can still coexist with restrictions inherited from
+  `User-agent: *`.
 - Preserve `categories` as source data during collection. Split or normalize it
   only in analysis.
 
