@@ -1,7 +1,7 @@
 # ai-web-signals
 
 `ai-web-signals` measures a small set of public signals showing how popular
-websites are adapting to AI discovery and crawler access.
+domains are adapting to AI discovery and crawler access.
 
 The V1 study asks:
 
@@ -18,6 +18,101 @@ intent.
 
 Python performs collection and deterministic parsing. R can be used for
 analysis, visualization, and reporting.
+
+## Repository data policy
+
+This repository is set up to commit code, documentation, and reproducibility
+metadata, not study data or rendered outputs.
+
+The following paths are local-only and ignored by git:
+
+```text
+data/input/
+data/raw/
+data/processed/
+results/tables/
+results/figures/
+_site/
+```
+
+To rerun the project, bring or generate the local data files described below.
+The report reads `data/processed/domains.csv`; it does not require committed
+generated tables, figures, or HTML from a previous run.
+
+## Quick start
+
+Prerequisites:
+
+- Python 3.11 or newer with `uv`
+- R with `renv`
+- Quarto
+
+From a clean clone, restore the R environment:
+
+```bash
+Rscript -e 'renv::restore()'
+```
+
+Add a Cloudflare Radar domain ranking CSV under `data/input/`, then collect the
+processed dataset:
+
+```bash
+mkdir -p data/input
+INPUT=data/input/cloudflare-radar_top-100000-domains_YYYYMMDD-YYYYMMDD.csv
+uv run python collection/fetch.py "$INPUT"
+```
+
+Render the report and regenerate tables and figures:
+
+```bash
+quarto render
+```
+
+If you already have a compatible processed file, place it at
+`data/processed/domains.csv` and run only the R restore and Quarto render
+steps.
+
+```bash
+mkdir -p data/processed
+```
+
+If `renv` sandbox activation hangs on a local machine, use a command-scoped
+workaround instead of changing the project `.Rprofile`:
+
+```bash
+RENV_CONFIG_SANDBOX_ENABLED=FALSE quarto render
+```
+
+## Output for publication
+
+The most portable publication artifacts are the generated PNG figures and CSV
+tables:
+
+```text
+results/figures/01-llms-adoption-by-rank.png
+results/figures/02-ai-bot-policy-by-purpose.png
+results/figures/03-explicit-vs-inherited-policy.png
+results/figures/04-discovery-and-restriction.png
+
+results/tables/key_metrics.csv
+results/tables/rank_band_summary.csv
+results/tables/bot_policy_summary.csv
+results/tables/category_summary.csv
+```
+
+Use `_site/index.html` as the review report: it shows the tables, plots,
+methodology notes, TODOs, and attribution in one place. For a PDF, the simplest
+portable path is to render the HTML report and print or export it to PDF from a
+browser. Quarto PDF rendering can also work on machines with a TeX installation,
+but it is not required for this project.
+
+Before publishing any chart or table, rerun:
+
+```bash
+quarto render
+```
+
+Then verify the claim text against `results/tables/`, not against copied values.
 
 ## Data source
 
@@ -128,6 +223,9 @@ data/raw/domains_checkpoint.meta.json
 Generated raw and processed files are reproducible and normally should not be
 committed.
 
+The `data/` directory is entirely local and ignored by git. Create the
+subdirectories as needed when collecting or supplying data.
+
 ## Output schema
 
 The output CSV contains one row per normalized domain and nine columns:
@@ -149,7 +247,7 @@ same as `false`.
 
 The blocking summaries count both full and partial restrictions. Therefore,
 `all` means every tracked bot has some restrictive rule. It does not
-necessarily mean every bot is completely blocked from the entire site.
+necessarily mean every tracked bot is restricted from every path on the domain.
 
 ### Tracked training bots
 
@@ -187,40 +285,43 @@ A wildcard `User-agent: *` policy can affect all three blocking summaries.
 However, `policy_explicit` is `true` only when `robots.txt` contains an exact
 group for at least one tracked AI agent.
 
-## Analyze in R
+## Report and analysis in R
 
-Load the CSV directly:
+The report title is **AI Web Signals** with the subtitle **How Popular Domains
+Are Responding to AI**.
 
-```r
-library(readr)
-library(dplyr)
+Python owns collection, endpoint classification, crawler-policy parsing,
+checkpointing, and processed CSV creation. R owns validation of the processed
+dataset, statistical summaries, rank-band analysis, category expansion, tables,
+visualization, and reporting.
 
-domains <- read_csv(
-  "data/processed/domains.csv",
-  na = "",
-  show_col_types = FALSE
-)
+The analysis code is intentionally small:
 
-domains |>
-  summarise(
-    domains = n(),
-    complete = sum(scan_status == "complete"),
-    llms_txt_present = sum(has_llms_txt %in% TRUE),
-    llms_txt_rate_among_known = mean(has_llms_txt, na.rm = TRUE)
-  )
+```text
+analysis/data.R       # loading, validation, rank bands, category expansion
+analysis/summaries.R  # metric definitions and denominator choices
+analysis/plots.R      # chart theme, figures, and plot-saving helper
+index.qmd             # report skeleton and explicit artifact generation
+_quarto.yml           # single-report Quarto project configuration
 ```
 
-Expand semicolon-delimited categories only when an analysis needs one row per
-category:
+Restore the R environment, then render the report from the repository root:
 
-```r
-library(tidyr)
-
-categories <- domains |>
-  select(domain, categories, has_llms_txt) |>
-  separate_longer_delim(categories, delim = ";") |>
-  mutate(categories = trimws(categories))
+```bash
+Rscript -e 'renv::restore()'
+quarto render
 ```
+
+The rendered HTML is written under `_site/`. During render, the report writes
+analysis tables and publication figures to:
+
+```text
+results/tables/
+results/figures/
+```
+
+Generated tables and figures are reproducible analysis outputs and are ignored
+by default unless the project later decides to publish a specific artifact.
 
 ## Interpretation constraints
 
