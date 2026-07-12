@@ -1,0 +1,22 @@
+project:
+  type: default
+  output-dir: _site
+  execute-dir: project
+  render:
+    - index.qmd
+
+format:
+  html:
+    toc: true
+    toc-depth: 2
+    code-fold: true
+    code-summary: "Show code"
+    link-external-newwindow: true
+    fig-responsive: true
+    embed-resources: false
+    df-print: paged
+
+execute:
+  message: false
+  warning: false
+  error: false

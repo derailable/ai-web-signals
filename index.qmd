@@ -1,0 +1,271 @@
+---
+title: "AI Web Signals"
+subtitle: "How Popular Domains Are Responding to AI"
+format:
+  html:
+    fig-width: 10
+    fig-height: 6
+---
+
+```{r}
+#| label: setup
+#| include: false
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(gt)
+  library(readr)
+  library(scales)
+  library(stringr)
+})
+
+source("analysis/data.R")
+source("analysis/summaries.R")
+source("analysis/plots.R")
+
+domains <- load_domains()
+domains <- add_rank_bands(domains)
+categories <- expand_categories(domains)
+
+scan_quality <- summarise_scan_quality(domains)
+key_metrics <- summarise_key_metrics(domains)
+rank_summary <- summarise_rank_bands(domains)
+bot_summary <- summarise_bot_policies(domains)
+explicit_summary <- summarise_explicit_policies(domains)
+discovery_summary <- summarise_discovery_and_restriction(domains)
+category_summary <- summarise_categories(categories, min_domains = 500)
+
+dir.create("results/tables", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+
+readr::write_csv(key_metrics, "results/tables/key_metrics.csv")
+readr::write_csv(rank_summary, "results/tables/rank_band_summary.csv")
+readr::write_csv(bot_summary, "results/tables/bot_policy_summary.csv")
+readr::write_csv(category_summary, "results/tables/category_summary.csv")
+
+llms_rank_plot <- plot_llms_by_rank(rank_summary)
+bot_policy_plot <- plot_bot_policy_distribution(bot_summary)
+explicit_policy_plot <- plot_explicit_policy(explicit_summary)
+discovery_restriction_plot <- plot_discovery_and_restriction(discovery_summary)
+category_rates_plot <- plot_category_rates(category_summary)
+
+save_publication_plot(llms_rank_plot, "01-llms-adoption-by-rank.png")
+save_publication_plot(bot_policy_plot, "02-ai-bot-policy-by-purpose.png")
+save_publication_plot(explicit_policy_plot, "03-explicit-vs-inherited-policy.png")
+save_publication_plot(discovery_restriction_plot, "04-discovery-and-restriction.png")
+
+metadata_path <- "data/raw/domains_checkpoint.meta.json"
+metadata_text <- if (file.exists(metadata_path)) readr::read_file(metadata_path) else NA_character_
+metadata_value <- function(field) {
+  if (is.na(metadata_text)) {
+    return(NA_character_)
+  }
+  match <- stringr::str_match(metadata_text, paste0('"', field, '"\\s*:\\s*"([^"]+)"'))
+  match[, 2]
+}
+
+input_filename <- metadata_value("input_filename")
+collection_created_at <- metadata_value("created_at")
+input_filename_label <- ifelse(
+  is.na(input_filename),
+  "not available in checkpoint metadata",
+  input_filename
+)
+collection_created_at_label <- ifelse(
+  is.na(collection_created_at),
+  "not available in checkpoint metadata",
+  collection_created_at
+)
+```
+
+This study measures public signals across popular domains: whether a plausible `/llms.txt` file was observed, how `robots.txt` declares access for tracked AI crawler groups, and whether those policies name tracked AI agents explicitly. It does not measure internal AI adoption, provider behavior, search visibility, or whether any AI system uses these signals.
+
+## Introduction
+
+I started as a web developer, back when "webmaster" was still a common title, before moving into security. As AI systems increasingly discover, index, and retrieve web content, I wanted to understand how popular domains are declaring preferences through public web mechanisms.
+
+TODO: Add the final framing after reviewing the measured results and deciding which signals matter most for the audience.
+
+## Key findings
+
+TODO: Select the three to five findings worth highlighting after reviewing the full tables and figures. Keep the statements factual and tied to explicit denominators.
+
+```{r}
+#| label: key-metrics
+
+key_metrics |>
+  dplyr::mutate(
+    value = dplyr::if_else(
+      is.na(.data$rate),
+      scales::comma(.data$numerator),
+      scales::percent(.data$rate, accuracy = 0.1)
+    ),
+    denominator = dplyr::if_else(
+      is.na(.data$denominator),
+      NA_character_,
+      scales::comma(.data$denominator)
+    ),
+    numerator = scales::comma(.data$numerator)
+  ) |>
+  dplyr::select(
+    Metric = .data$metric,
+    Value = .data$value,
+    Numerator = .data$numerator,
+    Denominator = .data$denominator
+  ) |>
+  gt::gt() |>
+  gt::tab_options(table.font.names = "sans")
+```
+
+## What this study measures
+
+The processed dataset contains `r scales::comma(nrow(domains))` domains from `data/processed/domains.csv`. The analysis treats `/llms.txt`, bot-access summaries, and explicit tracked-agent policy declarations as separate public signals.
+
+TODO: Describe the final population and date window after confirming the source input file and collection run.
+
+## Data quality
+
+Unknown values affect denominators throughout the report. Boolean unknowns are not counted as `FALSE`, and bot-policy values marked `unknown` are retained in distributions rather than hidden.
+
+```{r}
+#| label: scan-quality
+
+scan_quality |>
+  dplyr::mutate(
+    proportion = scales::percent(.data$proportion, accuracy = 0.1),
+    total_domains = scales::comma(.data$total_domains),
+    count = scales::comma(.data$count)
+  ) |>
+  gt::gt() |>
+  gt::cols_label(
+    scan_status = "Scan status",
+    total_domains = "Total domains",
+    count = "Count",
+    proportion = "Share"
+  ) |>
+  gt::tab_options(table.font.names = "sans")
+```
+
+## Adoption of `/llms.txt`
+
+Observed presence means the collector found a plausible public `/llms.txt` file. It does not measure file quality, usefulness, or whether AI providers consume the file.
+
+```{r}
+#| label: llms-by-rank
+
+llms_rank_plot
+```
+
+TODO: Interpret the rank-band pattern only after checking the generated `results/tables/rank_band_summary.csv` table.
+
+## AI crawler access policies
+
+This analysis separates three crawler-purpose groups: model training crawlers, AI search crawlers, and user-triggered retrieval agents. The chart summarizes declared `robots.txt` rules and does not prove enforcement.
+
+```{r}
+#| label: bot-policy-distribution
+
+bot_policy_plot
+```
+
+TODO: Decide whether to discuss differences across crawler-purpose groups in the final narrative.
+
+## Explicit and inherited policies
+
+An explicit tracked-agent policy means `robots.txt` names at least one tracked AI user-agent group. A wildcard policy can still affect AI agents without naming them, so non-explicit does not mean ineffective.
+
+```{r}
+#| label: explicit-policy
+
+explicit_policy_plot
+```
+
+TODO: Use this section to explain explicit AI-specific declarations without implying that inherited wildcard restrictions are weaker in practice.
+
+## Discovery and restriction can coexist
+
+Publishing `/llms.txt` and restricting crawler access are separate policy choices. This section compares known `/llms.txt` results with known bot-policy summaries and excludes rows where any required value is unknown.
+
+```{r}
+#| label: discovery-and-restriction
+
+discovery_restriction_plot
+```
+
+TODO: Confirm whether this comparison adds enough insight for the final report.
+
+## Differences by domain category
+
+Cloudflare categories can overlap, and a domain may appear in multiple category rows. Category-level comparisons should be treated as subgroup descriptions, not mutually exclusive segments.
+
+```{r}
+#| label: category-summary
+
+if (nrow(category_summary) > 0) {
+  category_summary |>
+    dplyr::slice_head(n = 20) |>
+    dplyr::mutate(
+      llms_txt_rate = scales::percent(.data$llms_txt_rate, accuracy = 0.1),
+      training_restrictive_rate = scales::percent(.data$training_restrictive_rate, accuracy = 0.1),
+      search_restrictive_rate = scales::percent(.data$search_restrictive_rate, accuracy = 0.1),
+      user_fetch_restrictive_rate = scales::percent(.data$user_fetch_restrictive_rate, accuracy = 0.1)
+    ) |>
+    dplyr::select(
+      Category = .data$overlapping_category,
+      Domains = .data$category_membership_count,
+      `/llms.txt rate` = .data$llms_txt_rate,
+      `Training restriction rate` = .data$training_restrictive_rate,
+      `AI-search restriction rate` = .data$search_restrictive_rate,
+      `User-fetch restriction rate` = .data$user_fetch_restrictive_rate
+    ) |>
+    gt::gt() |>
+    gt::tab_options(table.font.names = "sans")
+} else {
+  tibble::tibble(
+    note = "No categories meet the current minimum threshold of 500 domain memberships."
+  ) |>
+    gt::gt() |>
+    gt::cols_label(note = "Category analysis note")
+}
+```
+
+TODO: Remove or downplay this section if category differences do not add a meaningful, stable insight.
+
+## What these signals do not tell us
+
+The presence of `/llms.txt` does not establish file quality, usefulness, or adoption by any provider. `robots.txt` expresses declared crawler policy, not proven enforcement. The blocked summaries combine full and partial restrictions, so a restrictive result does not describe every path-level detail.
+
+User-fetch policy does not prove whether retrieval will occur for a specific request. Wildcard policies can affect AI agents without being AI-specific. The population includes domains such as APIs, CDNs, infrastructure services, and consumer-facing domains, so this report uses "domains" rather than "websites." Results are a time-bound snapshot.
+
+## Methodology
+
+The analysis reads `data/processed/domains.csv`, which contains one row per normalized domain and the nine processed fields documented in the repository README. The current processed data contains `r scales::comma(nrow(domains))` rows.
+
+The checkpoint metadata identifies the source input file as `r input_filename_label` and the collection metadata timestamp as `r collection_created_at_label`.
+
+TODO: Confirm the ranking period from the source filename before publication.
+
+For each domain, the collector requested:
+
+- `/llms.txt`
+- `/robots.txt`
+
+The crawler-purpose groups are:
+
+- Training bots: GPTBot, ClaudeBot, Google-Extended, Applebot-Extended, Meta-ExternalAgent
+- AI search bots: OAI-SearchBot, Claude-SearchBot, PerplexityBot, DuckAssistBot, MistralAI-Index
+- User-triggered retrieval agents: ChatGPT-User, Claude-User, Perplexity-User, MistralAI-User
+
+Unknown boolean values are excluded from known-result denominators and are never treated as `FALSE`. Bot-policy rates use known policy summaries (`none`, `some`, or `all`) as denominators and exclude `unknown`; bot-policy distribution charts keep `unknown` visible.
+
+Rank bands are non-overlapping: 1-100, 101-1,000, 1,001-10,000, 10,001-100,000, outside the study range, and unknown rank. Category analysis splits source categories on semicolons, trims whitespace, removes blank category values, and treats each category as an overlapping membership.
+
+For implementation details, see the repository README and the analysis scripts under `analysis/`.
+
+## Data source, attribution, and reproducibility
+
+Domain population derived from Cloudflare Radar Domain Rankings, published by Cloudflare, Inc. and made available under CC BY-NC 4.0.
+
+Cloudflare is the source of the domain population, not an author or endorser of this analysis.
+
+The rendered report writes reproducible tables to `results/tables/` and figures to `results/figures/`. Restore the R environment with `Rscript -e 'renv::restore()'` and render the report with `quarto render`.
