@@ -3,12 +3,12 @@ message: "If you use this software or its generated datasets, cite ai-web-signal
 title: "ai-web-signals"
 type: software
 authors:
-  - name: "TypeError"
-repository-code: "https://github.com/TypeError/ai-web-signals"
-url: "https://github.com/TypeError/ai-web-signals"
+  - name: "Derailable"
+repository-code: "https://github.com/derailable/ai-web-signals"
+url: "https://github.com/derailable/ai-web-signals"
 license: "MIT"
 version: "0.1.0"
-date-released: "2026-07-11"
+date-released: "2026-07-29"
 abstract: "Collect public AI-related web discovery and crawler-access signals across popular domains sourced from Cloudflare Radar."
 references:
   - type: dataset
