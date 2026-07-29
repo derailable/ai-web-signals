@@ -210,6 +210,14 @@ tempCodeRunnerFile.py
 # macOS
 .DS_Store
 
+# Local study data and rendered artifacts
+data/input/
+data/raw/
+data/processed/
+results/tables/
+results/figures/
+_site/
+
 # PyPI configuration file
 .pypirc
 
