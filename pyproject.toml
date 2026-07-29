@@ -9,8 +9,8 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/TypeError/ai-web-signals"
-Documentation = "https://github.com/TypeError/ai-web-signals#readme"
+Repository = "https://github.com/derailable/ai-web-signals"
+Documentation = "https://github.com/derailable/ai-web-signals#readme"
 "Data source" = "https://radar.cloudflare.com/domains"
 
 [dependency-groups]
@@ -21,3 +21,6 @@ dev = [
 [tool.ruff]
 line-length = 88
 target-version = "py311"
+
+[tool.pyrefly]
+python-interpreter-path = ".venv/bin/python3"
