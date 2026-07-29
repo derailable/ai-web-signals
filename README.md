@@ -1,30 +1,23 @@
 # ai-web-signals
 
-`ai-web-signals` measures a small set of public signals showing how popular
-domains are adapting to AI discovery and crawler access.
+`ai-web-signals` measures a narrow set of public web signals across
+Cloudflare Radar's Top 100,000 domain population:
 
-The V1 study asks:
+1. whether a plausible `/llms.txt` is published;
+2. how `/robots.txt` declares policy for documented AI-related agents; and
+3. whether that policy is explicit to a tracked agent or inherited from
+   `User-agent: *`.
 
-1. Does the domain publish a plausible `/llms.txt` file?
-2. Does `/robots.txt` restrict major AI training crawlers?
-3. Does `/robots.txt` restrict major AI search crawlers?
-4. Does `/robots.txt` restrict user-triggered AI fetch agents?
-5. Are those policies written specifically for tracked AI agents or inherited
-   from `User-agent: *`?
+This is a measurement of published site policy and public discovery signals. It
+does not prove crawler compliance, AI-provider behavior, search visibility,
+internal AI adoption, or legal permission.
 
-This is a measurement of public web signals. It is not a complete measure of AI
-adoption, internal AI use, search visibility, crawler behavior, or provider
-intent.
+Python performs collection and deterministic parsing. R performs loading,
+validation, summaries, visualization, and report work.
 
-Python performs collection and deterministic parsing. R can be used for
-analysis, visualization, and reporting.
+## Repository Data Policy
 
-## Repository data policy
-
-This repository is set up to commit code, documentation, and reproducibility
-metadata, not study data or rendered outputs.
-
-The following paths are local-only and ignored by git:
+Generated data and rendered outputs are local-only:
 
 ```text
 data/input/
@@ -35,128 +28,73 @@ results/figures/
 _site/
 ```
 
-To rerun the project, bring or generate the local data files described below.
-The report reads `data/processed/domains.csv`; it does not require committed
-generated tables, figures, or HTML from a previous run.
+Keep original source files under `data/input/` for local provenance. Do not
+commit collected checkpoint files, processed CSVs, figures, or rendered reports.
 
-## Quick start
+## Data Source
+
+Use the manually downloaded Cloudflare Radar domain bucket file as the primary
+workflow for this study. A Cloudflare API token is not required.
+
+Cloudflare documents two different domain datasets:
+
+- the ordered Top 100 list; and
+- unordered popularity bucket datasets, including Top 100,000.
+
+For this project, the ordinary Top 100,000 CSV is treated as an unordered
+popularity bucket. Do not treat row order as rank, manufacture sequential ranks,
+or make rank-band claims from this file. The processed CSV intentionally omits
+rank and bucket columns; source-population provenance is retained in checkpoint
+metadata.
+
+Official source reference:
+<https://developers.cloudflare.com/radar/investigate/domain-ranking-datasets/>
+
+## Expected Input
+
+The collector accepts UTF-8 CSV input with a domain column:
+
+| Column | Required | Aliases | Behavior |
+| --- | --- | --- | --- |
+| `domain` | Yes | `hostname`, `host`, one unambiguous `*domain*` column | Normalized with IDNA, lowercased, trailing dot removed, validated, and deduplicated |
+
+An input `rank` or `ranking` column is ignored for the Top 100,000 bucket unless
+the collection method is later changed to a provenance-backed ordered Cloudflare
+Top 100 source. A single `domain` column remains sufficient.
+
+Example:
+
+```csv
+domain
+googleapis.com
+googlevideo.com
+```
+
+## Collect Data
 
 Prerequisites:
 
 - Python 3.11 or newer with `uv`
 - R with `renv`
-- Quarto
+- Quarto for report rendering
 
-From a clean clone, restore the R environment:
+Install Python dependencies:
+
+```bash
+uv sync
+```
+
+Restore R dependencies:
 
 ```bash
 Rscript -e 'renv::restore()'
 ```
 
-Add a Cloudflare Radar domain ranking CSV under `data/input/`, then collect the
-processed dataset:
+If `renv` sandbox activation hangs locally, use:
 
 ```bash
-mkdir -p data/input
-INPUT=data/input/cloudflare-radar_top-100000-domains_YYYYMMDD-YYYYMMDD.csv
-uv run python collection/fetch.py "$INPUT"
+RENV_CONFIG_SANDBOX_ENABLED=FALSE Rscript -e 'renv::restore()'
 ```
-
-Render the report and regenerate tables and figures:
-
-```bash
-quarto render
-```
-
-If you already have a compatible processed file, place it at
-`data/processed/domains.csv` and run only the R restore and Quarto render
-steps.
-
-```bash
-mkdir -p data/processed
-```
-
-If `renv` sandbox activation hangs on a local machine, use a command-scoped
-workaround instead of changing the project `.Rprofile`:
-
-```bash
-RENV_CONFIG_SANDBOX_ENABLED=FALSE quarto render
-```
-
-## Output for publication
-
-The most portable publication artifacts are the generated PNG figures and CSV
-tables:
-
-```text
-results/figures/01-llms-adoption-by-rank.png
-results/figures/02-ai-bot-policy-by-purpose.png
-results/figures/03-explicit-vs-inherited-policy.png
-results/figures/04-discovery-and-restriction.png
-
-results/tables/key_metrics.csv
-results/tables/rank_band_summary.csv
-results/tables/bot_policy_summary.csv
-results/tables/category_summary.csv
-```
-
-Use `_site/index.html` as the review report: it shows the tables, plots,
-methodology notes, TODOs, and attribution in one place. For a PDF, the simplest
-portable path is to render the HTML report and print or export it to PDF from a
-browser. Quarto PDF rendering can also work on machines with a TeX installation,
-but it is not required for this project.
-
-Before publishing any chart or table, rerun:
-
-```bash
-quarto render
-```
-
-Then verify the claim text against `results/tables/`, not against copied values.
-
-## Data source
-
-The domain population comes from
-[Cloudflare Radar Domain Rankings](https://radar.cloudflare.com/domains).
-
-For the current study, download the Top 100,000 domains CSV from Cloudflare
-Radar and save the original file under `data/input/`. Include the download date
-or date range in the filename.
-
-Example:
-
-```text
-data/input/cloudflare-radar_top-100000-domains_YYYYMMDD-YYYYMMDD.csv
-```
-
-Keep the source file unchanged for provenance and reproducibility.
-
-### Expected input
-
-The collector accepts a CSV with these columns:
-
-| Column       | Required | Behavior                                |
-| ------------ | -------- | --------------------------------------- |
-| `domain`     | Yes      | Normalized, validated, and deduplicated |
-| `rank`       | No       | Preserved when it contains an integer   |
-| `categories` | No       | Preserved verbatim from the input       |
-
-`hostname` or `host` can be used instead of `domain`. `ranking` can be used
-instead of `rank`, and `category` can be used instead of `categories`.
-
-Multiple category labels remain in the original field. For example:
-
-```csv
-rank,domain,categories
-2,googleapis.com,Information Technology;Content Servers
-9,googlevideo.com,Search Engines;Video Streaming
-```
-
-The collector does not select a primary category or split category values.
-
-## Collect the data
-
-The only runtime dependency is `httpx`.
 
 Set the input path:
 
@@ -164,32 +102,39 @@ Set the input path:
 INPUT=data/input/cloudflare-radar_top-100000-domains_YYYYMMDD-YYYYMMDD.csv
 ```
 
-Run a small sample:
+Run a 100-domain smoke collection:
 
 ```bash
 uv run python collection/fetch.py "$INPUT" --limit 100 --fresh
 ```
 
-Run the full collection:
+Run the full Top 100,000 collection:
 
 ```bash
 uv run python collection/fetch.py "$INPUT"
 ```
 
-The collector resumes automatically. Domains with a complete prior result are
-skipped. Partial and failed rows are retried when the same command is run again.
-
-Use `--fresh` only when you intend to delete the existing checkpoint and start
-the collection again:
+Resume uses the same command. Use `--fresh` only to discard the existing
+checkpoint and processed CSV:
 
 ```bash
 uv run python collection/fetch.py "$INPUT" --fresh
 ```
 
-A checkpoint is tied to the input file contents and output schema. If either
-changes, start a new run with `--fresh`.
+Operational options:
 
-## Collection scope
+```text
+--limit N
+--fresh
+--workers N
+--request-concurrency N
+--connect-timeout SECONDS
+--read-timeout SECONDS
+```
+
+Defaults are conservative: 30 domain workers and 40 concurrent HTTP requests.
+
+## Collection Scope
 
 For each domain, the collector requests only:
 
@@ -198,161 +143,308 @@ For each domain, the collector requests only:
 /robots.txt
 ```
 
-It does not request the homepage, `/llms-full.txt`, sitemaps, manifests, or
-links found in either file.
+It does not fetch homepages, `/llms-full.txt`, sitemaps, discovered links,
+JavaScript-rendered pages, DNS enrichment, WHOIS, certificates, technology
+fingerprints, or additional external APIs.
 
-The collector uses HTTPS first, follows validated redirects, and falls back to
-HTTP only after selected connection or TLS failures. Response bodies are
-sampled rather than downloaded without a limit.
+Network behavior:
 
-## Data artifacts
+- one shared asynchronous `httpx` client;
+- bounded worker and request concurrency;
+- explicit connect, read, write, and pool timeouts;
+- HTTPS first;
+- HTTP fallback only after selected connection or TLS failures;
+- no HTTP fallback after an HTTP response or application-level result;
+- HTTP/HTTPS redirects only, with a redirect limit;
+- redirect targets screened for credentials and unsafe address classes;
+- bounded streaming body reads;
+- transient retries only, with bounded `Retry-After` and jitter;
+- TLS verification remains enabled; and
+- user agent:
+  `AIWebSignals/<version> (+https://github.com/derailable/ai-web-signals)`.
 
-Analysis-ready output:
+The redirect DNS safety cache is a practical defense, not a proof against every
+DNS-rebinding race inside the HTTP stack.
+
+## Processed CSV
+
+Analysis output is atomically written to:
 
 ```text
 data/processed/domains.csv
 ```
 
-Automatic checkpoint files:
+The file is UTF-8 CSV, one row per normalized domain, deterministic in input
+order, and contains no response bodies or raw HTTP diagnostics.
+
+Table grain: one row represents one normalized source domain and its collected
+AI web signals. There are no row names, index columns, rank columns, nested JSON
+cells, or one-row-per-bot expansions.
+
+Exact ordered schema:
+
+| column | r_type | nullable | allowed_values | description |
+| --- | --- | --- | --- | --- |
+| `domain` | character | no | normalized hostname | ASCII/IDNA normalized source domain. |
+| `has_llms_txt` | logical | yes | `true`, `false`, blank | True only for plausible observed `/llms.txt`; blank when unresolved. |
+| `llms_txt_status` | character | no | see endpoint enums | `/llms.txt` endpoint classification. |
+| `robots_txt_status` | character | no | see endpoint enums | `/robots.txt` endpoint classification. |
+| `has_explicit_ai_policy` | logical | yes | `true`, `false`, blank | Whether any tracked policy came from an explicit matching group. |
+| `training_bots_restricted` | character | no | see grouped enum | Restriction summary for training/control tokens. |
+| `search_bots_restricted` | character | no | see grouped enum | Restriction summary for search/indexing agents. |
+| `user_fetch_bots_restricted` | character | no | see grouped enum | Restriction summary for user-triggered agents. |
+| `gpt_bot_policy` | character | no | see policy enum | Policy for `GPTBot`. |
+| `claude_bot_policy` | character | no | see policy enum | Policy for `ClaudeBot`. |
+| `google_extended_policy` | character | no | see policy enum | Policy for `Google-Extended`. |
+| `applebot_extended_policy` | character | no | see policy enum | Policy for `Applebot-Extended`. |
+| `meta_external_agent_policy` | character | no | see policy enum | Policy for `meta-externalagent`. |
+| `oai_search_bot_policy` | character | no | see policy enum | Policy for `OAI-SearchBot`. |
+| `claude_search_bot_policy` | character | no | see policy enum | Policy for `Claude-SearchBot`. |
+| `perplexity_bot_policy` | character | no | see policy enum | Policy for `PerplexityBot`. |
+| `duck_assist_bot_policy` | character | no | see policy enum | Policy for `DuckAssistBot`. |
+| `mistral_ai_index_policy` | character | no | see policy enum | Policy for `MistralAI-Index`. |
+| `chatgpt_user_policy` | character | no | see policy enum | Policy for `ChatGPT-User`. |
+| `claude_user_policy` | character | no | see policy enum | Policy for `Claude-User`. |
+| `perplexity_user_policy` | character | no | see policy enum | Policy for `Perplexity-User`. |
+| `mistral_ai_user_policy` | character | no | see policy enum | Policy for `MistralAI-User`. |
+| `scan_status` | character | no | `complete`, `partial`, `failed` | Overall endpoint completion status. |
+
+Boolean fields use lowercase `true` and `false`; unknown booleans are unquoted
+empty fields and must not be read as `false`. Categorical `unknown` is an enum
+value, not a missing value.
+
+Canonical R import:
+
+```r
+source("analysis/data.R")
+
+domains <- readr::read_csv(
+  "data/processed/domains.csv",
+  col_types = domain_col_types,
+  na = "",
+  locale = readr::locale(encoding = "UTF-8"),
+  name_repair = "check_unique",
+  show_col_types = FALSE,
+  progress = FALSE
+)
+
+validate_domains(domains)
+```
+
+`load_domains()` wraps this import and validation. It fails if names, order,
+types, duplicates, accidental index columns, parsing problems, or enum values do
+not match the schema.
+
+The Python writer also validates exact column order, unique snake-case names,
+valid logical/status/policy values, per-agent `_policy` suffixes, duplicate
+domains, absence of rank/index columns, scalar cells, and output row count
+before atomically replacing the CSV.
+
+### Endpoint Statuses
+
+`llms_txt_status`:
+
+```text
+present
+absent
+empty
+html
+non_text
+http_error
+network_error
+```
+
+`has_llms_txt` is `true` only for `present`, `false` for known non-present
+states (`absent`, `empty`, `html`, `non_text`), and blank for unresolved HTTP or
+network failures.
+
+`robots_txt_status`:
+
+```text
+parsed
+absent
+empty
+html
+non_text
+unparseable
+http_error
+network_error
+```
+
+`robots.txt` classifications describe declared policy shape, not verified
+path-level access or provider compliance.
+
+### Per-Agent Policy Enum
+
+Each per-agent policy column uses:
+
+```text
+allow_default
+allow_explicit
+allow_wildcard
+partial_explicit
+partial_wildcard
+blocked_explicit
+blocked_wildcard
+unknown
+```
+
+Definitions:
+
+- `allow_default`: no explicit or wildcard group applies;
+- `allow_explicit`: an explicit matching group applies with no effective
+  restriction;
+- `allow_wildcard`: the wildcard group applies with no effective restriction;
+- `partial_explicit`: an explicit group declares some restriction but not a
+  simple full-site disallow;
+- `partial_wildcard`: wildcard declares some restriction but not a simple
+  full-site disallow;
+- `blocked_explicit`: explicit group contains unqualified `Disallow: /`;
+- `blocked_wildcard`: wildcard group contains unqualified `Disallow: /`; and
+- `unknown`: robots policy could not be classified.
+
+A full-site disallow with meaningful `Allow` exceptions is classified as
+partial.
+
+### Summary Fields
+
+`training_bots_restricted`, `search_bots_restricted`, and
+`user_fetch_bots_restricted` use:
+
+```text
+none
+some
+all
+unknown
+```
+
+Partial and full restrictions both count as restricted. `all` means all tracked
+agents in that group have some declared restriction; it does not necessarily
+mean every path is blocked. `unknown` remains distinct from `none`.
+
+`has_explicit_ai_policy` reports whether any tracked policy came from an explicit
+agent group.
+
+## Tracked Agents
+
+| token | purpose_group | processed_column |
+| --- | --- | --- |
+| `GPTBot` | training | `gpt_bot_policy` |
+| `ClaudeBot` | training | `claude_bot_policy` |
+| `Google-Extended` | training/control token | `google_extended_policy` |
+| `Applebot-Extended` | training/control token | `applebot_extended_policy` |
+| `meta-externalagent` | training | `meta_external_agent_policy` |
+| `OAI-SearchBot` | search/indexing | `oai_search_bot_policy` |
+| `Claude-SearchBot` | search/indexing | `claude_search_bot_policy` |
+| `PerplexityBot` | search/indexing | `perplexity_bot_policy` |
+| `DuckAssistBot` | search/indexing | `duck_assist_bot_policy` |
+| `MistralAI-Index` | search/indexing | `mistral_ai_index_policy` |
+| `ChatGPT-User` | user-triggered fetching | `chatgpt_user_policy` |
+| `Claude-User` | user-triggered fetching | `claude_user_policy` |
+| `Perplexity-User` | user-triggered fetching | `perplexity_user_policy` |
+| `MistralAI-User` | user-triggered fetching | `mistral_ai_user_policy` |
+
+`Google-Extended` and `Applebot-Extended` are robots control tokens rather than
+standalone HTTP crawlers. The official Meta crawler URL is linked from
+Cloudflare Radar's verified bot directory.
+
+User-triggered agents may be initiated by a person using a product, and some
+first-party documentation states that robots rules may not apply or may
+generally be ignored. This project still measures the site's declared policy
+toward those tokens.
+
+First-party references:
+
+- OpenAI: <https://developers.openai.com/api/docs/bots>
+- Anthropic: <https://support.anthropic.com/en/articles/8896518-does-anthropic-crawl-data-from-the-web-and-how-can-site-owners-block-the-crawler>
+- Google: <https://developers.google.com/crawling/docs/crawlers-fetchers/google-common-crawlers>
+- Apple: <https://support.apple.com/en-ie/119829>
+- Perplexity: <https://docs.perplexity.ai/docs/resources/perplexity-crawlers>
+- Mistral: <https://docs.mistral.ai/robots>
+- DuckDuckGo: <https://duckduckgo.com/duckduckgo-help-pages/results/duckassistbot>
+- Meta crawler URL: <https://developers.facebook.com/docs/sharing/webmasters/web-crawlers>
+
+## Checkpoint And Resume
+
+Checkpoint files:
 
 ```text
 data/raw/domains_checkpoint.jsonl
 data/raw/domains_checkpoint.meta.json
 ```
 
-Generated raw and processed files are reproducible and normally should not be
-committed.
-
-The `data/` directory is entirely local and ignored by git. Create the
-subdirectories as needed when collecting or supplying data.
-
-## Output schema
-
-The output CSV contains one row per normalized domain and nine columns:
-
-| Column                    | Values                           | Meaning                                                                |
-| ------------------------- | -------------------------------- | ---------------------------------------------------------------------- |
-| `rank`                    | integer or blank                 | Rank copied from the input when available                              |
-| `domain`                  | text                             | Normalized domain                                                      |
-| `categories`              | text or blank                    | Category value copied verbatim from the input                          |
-| `has_llms_txt`            | `true`, `false`, or blank        | Whether a plausible public `/llms.txt` was observed                    |
-| `training_bots_blocked`   | `none`, `some`, `all`, `unknown` | How many tracked training bots have restrictive rules                  |
-| `search_bots_blocked`     | `none`, `some`, `all`, `unknown` | How many tracked AI search bots have restrictive rules                 |
-| `user_fetch_bots_blocked` | `none`, `some`, `all`, `unknown` | How many tracked user-triggered AI fetch agents have restrictive rules |
-| `policy_explicit`         | `true`, `false`, or blank        | Whether an exact tracked AI user-agent group appears in `robots.txt`   |
-| `scan_status`             | `complete`, `partial`, `failed`  | Whether both endpoint results could be classified                      |
-
-Blank boolean values mean the result could not be determined. They are not the
-same as `false`.
-
-The blocking summaries count both full and partial restrictions. Therefore,
-`all` means every tracked bot has some restrictive rule. It does not
-necessarily mean every tracked bot is restricted from every path on the domain.
-
-### Tracked training bots
+The JSONL checkpoint is an internal collection record, not a duplicate of the
+analysis CSV. It preserves compact endpoint evidence:
 
 ```text
-GPTBot
-ClaudeBot
-Google-Extended
-Applebot-Extended
-Meta-ExternalAgent
+attempted
+completed
+requested_scheme
+final_scheme
+http_status
+content_type
+bytes_read
+body_truncated
+redirect_count
+retry_count
+error_type
+classification
+fetched_at
 ```
 
-### Tracked AI search bots
+It also preserves final per-agent robots classifications. It does not store
+response bodies, cookies, arbitrary headers, credentials, secrets, full
+exception strings, or final URLs with query strings.
 
-```text
-OAI-SearchBot
-Claude-SearchBot
-PerplexityBot
-DuckAssistBot
-MistralAI-Index
-```
+Resume is endpoint-aware:
 
-### Tracked user-fetch agents
+- if `/llms.txt` is complete and `/robots.txt` failed, only `/robots.txt` is
+  retried;
+- if `/robots.txt` is complete and `/llms.txt` failed, only `/llms.txt` is
+  retried;
+- if both endpoints are complete, neither is requested again;
+- an incomplete final JSONL line is ignored;
+- non-final checkpoint corruption fails clearly; and
+- successful completion compacts the checkpoint atomically to one latest record
+  per domain.
 
-```text
-ChatGPT-User
-Claude-User
-Perplexity-User
-MistralAI-User
-```
+The metadata records schema version, collector version, input filename, input
+SHA-256, input row count, source population, popularity bucket, tracked-agent
+taxonomy digest, collection settings digest, start time, completion time, and
+final status counts. If any relevant compatibility value changes, resume is
+refused with instructions to use `--fresh`.
 
-User-fetch agents represent retrieval initiated on behalf of a user. They are
-reported separately from automated training and AI search crawlers.
+## Analysis
 
-A wildcard `User-agent: *` policy can affect all three blocking summaries.
-However, `policy_explicit` is `true` only when `robots.txt` contains an exact
-group for at least one tracked AI agent.
-
-## Report and analysis in R
-
-The report title is **AI Web Signals** with the subtitle **How Popular Domains
-Are Responding to AI**.
-
-Python owns collection, endpoint classification, crawler-policy parsing,
-checkpointing, and processed CSV creation. R owns validation of the processed
-dataset, statistical summaries, rank-band analysis, category expansion, tables,
-visualization, and reporting.
-
-The analysis code is intentionally small:
-
-```text
-analysis/data.R       # loading, validation, rank bands, category expansion
-analysis/summaries.R  # metric definitions and denominator choices
-analysis/plots.R      # chart theme, figures, and plot-saving helper
-index.qmd             # report skeleton and explicit artifact generation
-_quarto.yml           # single-report Quarto project configuration
-```
-
-Restore the R environment, then render the report from the repository root:
+Load the processed CSV from R:
 
 ```bash
-Rscript -e 'renv::restore()'
+RENV_CONFIG_SANDBOX_ENABLED=FALSE Rscript -e 'source("analysis/data.R"); d <- load_domains(); print(dim(d))'
+```
+
+Render the report when ready to work on narrative and figures:
+
+```bash
 quarto render
 ```
 
-The rendered HTML is written under `_site/`. During render, the report writes
-analysis tables and publication figures to:
+The report remains a draft scaffold. Final conclusions, polished charts, and
+publication narrative belong in the R/Quarto phase after the full collection.
 
-```text
-results/tables/
-results/figures/
-```
+## Limitations
 
-Generated tables and figures are reproducible analysis outputs and are ignored
-by default unless the project later decides to publish a specific artifact.
+- Cloudflare Top 100,000 bucket membership is coarse popularity evidence, not an
+  exact rank.
+- `robots.txt` is a declared crawler policy mechanism, not access control.
+- User-agent strings can be spoofed.
+- Redirect target screening reduces obvious unsafe fetches but cannot guarantee
+  perfect DNS-rebinding prevention.
+- `/llms.txt` is classified only for plausible presence, not semantic quality.
+- Live sites change; smoke-test outcomes should not be treated as findings.
 
-## Interpretation constraints
+## Attribution And License
 
-- Treat `scan_status` as a data-quality field and report unknown results.
-- Do not treat a blank boolean as `false`.
-- `has_llms_txt` measures whether a plausible public file was observed. It does
-  not measure the file's quality, usefulness, or adoption by AI systems.
-- `training_bots_blocked`, `search_bots_blocked`, and
-  `user_fetch_bots_blocked` summarize restrictive rules. They do not prove
-  that providers honor those rules.
-- `user_fetch_bots_blocked` measures declared access policy for user-triggered
-  retrieval. It does not prove whether a provider will or will not fetch a page
-  in response to a user request.
-- `policy_explicit = false` can still coexist with restrictions inherited from
-  `User-agent: *`.
-- Preserve `categories` as source data during collection. Split or normalize it
-  only in analysis.
-
-## Provenance, license, and citation
-
-Project code is licensed under the root [LICENSE](LICENSE). Cloudflare Radar
-source data is separate third-party data made available under
-[CC BY-NC 4.0](https://creativecommons.org/licenses/by-nc/4.0/).
-
-Preserve this attribution in reports and derived datasets:
-
-> Domain population derived from Cloudflare Radar Domain Rankings, published by
-> Cloudflare, Inc. at https://radar.cloudflare.com/domains and made available
-> under CC BY-NC 4.0.
-
-Cloudflare is the source of the domain population, not an author of this project
-or its measurements. Cloudflare does not endorse this project or its findings.
-
-Use [CITATION.cff](CITATION.cff) to cite `ai-web-signals` itself.
+Domain population derived from Cloudflare Radar Domain Rankings, published by
+Cloudflare, Inc. Cloudflare is the source of the population, not an author or
+endorser of this analysis. The Cloudflare dataset is made available under
+CC BY-NC 4.0. Project code is MIT licensed.
