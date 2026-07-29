@@ -14,7 +14,7 @@ rate_or_na <- function(numerator, denominator) {
 }
 
 count_known_policy <- function(policy_result) {
-  sum(policy_result %in% known_bot_policy_values)
+  sum(policy_result %in% known_grouped_restriction_values)
 }
 
 count_restrictive_policy <- function(policy_result) {
@@ -53,17 +53,17 @@ summarise_key_metrics <- function(domains) {
   known_llms_results <- sum(!is.na(domains$has_llms_txt))
   observed_llms <- sum(domains$has_llms_txt %in% TRUE)
 
-  training_known <- count_known_policy(domains$training_bots_blocked)
-  training_restrictive <- count_restrictive_policy(domains$training_bots_blocked)
+  training_known <- count_known_policy(domains$training_bots_restricted)
+  training_restrictive <- count_restrictive_policy(domains$training_bots_restricted)
 
-  search_known <- count_known_policy(domains$search_bots_blocked)
-  search_restrictive <- count_restrictive_policy(domains$search_bots_blocked)
+  search_known <- count_known_policy(domains$search_bots_restricted)
+  search_restrictive <- count_restrictive_policy(domains$search_bots_restricted)
 
-  user_fetch_known <- count_known_policy(domains$user_fetch_bots_blocked)
-  user_fetch_restrictive <- count_restrictive_policy(domains$user_fetch_bots_blocked)
+  user_fetch_known <- count_known_policy(domains$user_fetch_bots_restricted)
+  user_fetch_restrictive <- count_restrictive_policy(domains$user_fetch_bots_restricted)
 
-  policy_explicit_known <- sum(!is.na(domains$policy_explicit))
-  policy_explicit_count <- sum(domains$policy_explicit %in% TRUE)
+  has_explicit_ai_policy_known <- sum(!is.na(domains$has_explicit_ai_policy))
+  has_explicit_ai_policy_count <- sum(domains$has_explicit_ai_policy %in% TRUE)
 
   tibble::tibble(
     metric_id = c(
@@ -100,7 +100,7 @@ summarise_key_metrics <- function(domains) {
       training_restrictive,
       search_restrictive,
       user_fetch_restrictive,
-      policy_explicit_count
+      has_explicit_ai_policy_count
     ),
     denominator = c(
       NA_integer_,
@@ -112,54 +112,10 @@ summarise_key_metrics <- function(domains) {
       training_known,
       search_known,
       user_fetch_known,
-      policy_explicit_known
+      has_explicit_ai_policy_known
     )
   ) |>
     dplyr::mutate(rate = rate_or_na(.data$numerator, .data$denominator))
-}
-
-#' Summarise adoption and policy metrics by ordered rank band.
-summarise_rank_bands <- function(domains) {
-  if (!"rank_band" %in% names(domains)) {
-    domains <- add_rank_bands(domains)
-  }
-
-  domains |>
-    dplyr::group_by(.data$rank_band, .drop = FALSE) |>
-    dplyr::summarise(
-      total_domains = dplyr::n(),
-      complete_scans = sum(.data$scan_status == "complete", na.rm = TRUE),
-      known_llms_results = sum(!is.na(.data$has_llms_txt)),
-      llms_txt_observed_count = sum(.data$has_llms_txt %in% TRUE),
-      training_policy_known = count_known_policy(.data$training_bots_blocked),
-      training_restrictive_count = count_restrictive_policy(.data$training_bots_blocked),
-      search_policy_known = count_known_policy(.data$search_bots_blocked),
-      search_restrictive_count = count_restrictive_policy(.data$search_bots_blocked),
-      user_fetch_policy_known = count_known_policy(.data$user_fetch_bots_blocked),
-      user_fetch_restrictive_count = count_restrictive_policy(.data$user_fetch_bots_blocked),
-      explicit_policy_known = sum(!is.na(.data$policy_explicit)),
-      explicit_policy_count = sum(.data$policy_explicit %in% TRUE),
-      .groups = "drop"
-    ) |>
-    dplyr::mutate(
-      llms_txt_rate = rate_or_na(.data$llms_txt_observed_count, .data$known_llms_results),
-      training_restrictive_rate = rate_or_na(
-        .data$training_restrictive_count,
-        .data$training_policy_known
-      ),
-      search_restrictive_rate = rate_or_na(
-        .data$search_restrictive_count,
-        .data$search_policy_known
-      ),
-      user_fetch_restrictive_rate = rate_or_na(
-        .data$user_fetch_restrictive_count,
-        .data$user_fetch_policy_known
-      ),
-      explicit_policy_rate = rate_or_na(
-        .data$explicit_policy_count,
-        .data$explicit_policy_known
-      )
-    )
 }
 
 #' Summarise bot-policy outcomes by crawler purpose.
@@ -169,9 +125,9 @@ summarise_bot_policies <- function(domains) {
 
   domains |>
     dplyr::select(
-      training = training_bots_blocked,
-      ai_search = search_bots_blocked,
-      user_triggered_retrieval = user_fetch_bots_blocked
+      training = training_bots_restricted,
+      ai_search = search_bots_restricted,
+      user_triggered_retrieval = user_fetch_bots_restricted
     ) |>
     tidyr::pivot_longer(
       dplyr::everything(),
@@ -203,7 +159,7 @@ summarise_bot_policies <- function(domains) {
 #' Summarise explicit tracked-agent policy declarations.
 summarise_explicit_policies <- function(domains) {
   scope_levels <- c(
-    "All domains with known policy_explicit",
+    "All domains with known explicit-policy status",
     "Domains with at least one restrictive AI-bot policy"
   )
   label_levels <- c(
@@ -212,21 +168,21 @@ summarise_explicit_policies <- function(domains) {
     "Unknown"
   )
 
-  classify_policy <- function(policy_explicit) {
+  classify_policy <- function(has_explicit_ai_policy) {
     dplyr::case_when(
-      policy_explicit %in% TRUE ~ "Explicit tracked AI policy",
-      policy_explicit %in% FALSE ~ "Inherited or non-explicit policy",
+      has_explicit_ai_policy %in% TRUE ~ "Explicit tracked AI policy",
+      has_explicit_ai_policy %in% FALSE ~ "Inherited or non-explicit policy",
       TRUE ~ "Unknown"
     )
   }
 
-  has_restrictive_policy <- is_restrictive_policy(domains$training_bots_blocked) %in% TRUE |
-    is_restrictive_policy(domains$search_bots_blocked) %in% TRUE |
-    is_restrictive_policy(domains$user_fetch_bots_blocked) %in% TRUE
+  has_restrictive_policy <- is_restrictive_policy(domains$training_bots_restricted) %in% TRUE |
+    is_restrictive_policy(domains$search_bots_restricted) %in% TRUE |
+    is_restrictive_policy(domains$user_fetch_bots_restricted) %in% TRUE
 
   known_explicit_domains <- domains |>
-    dplyr::filter(!is.na(.data$policy_explicit)) |>
-    dplyr::mutate(scope = "All domains with known policy_explicit")
+    dplyr::filter(!is.na(.data$has_explicit_ai_policy)) |>
+    dplyr::mutate(scope = "All domains with known explicit-policy status")
 
   restrictive_domains <- domains |>
     dplyr::filter(has_restrictive_policy) |>
@@ -234,14 +190,14 @@ summarise_explicit_policies <- function(domains) {
 
   dplyr::bind_rows(known_explicit_domains, restrictive_domains) |>
     dplyr::mutate(
-      policy_explicit_result = classify_policy(.data$policy_explicit),
-      policy_explicit_result = factor(.data$policy_explicit_result, levels = label_levels),
+      has_explicit_ai_policy_result = classify_policy(.data$has_explicit_ai_policy),
+      has_explicit_ai_policy_result = factor(.data$has_explicit_ai_policy_result, levels = label_levels),
       scope = factor(.data$scope, levels = scope_levels)
     ) |>
-    dplyr::count(.data$scope, .data$policy_explicit_result, .drop = FALSE, name = "count") |>
+    dplyr::count(.data$scope, .data$has_explicit_ai_policy_result, .drop = FALSE, name = "count") |>
     tidyr::complete(
       scope = factor(scope_levels, levels = scope_levels),
-      policy_explicit_result = factor(label_levels, levels = label_levels),
+      has_explicit_ai_policy_result = factor(label_levels, levels = label_levels),
       fill = list(count = 0)
     ) |>
     dplyr::group_by(.data$scope) |>
@@ -259,9 +215,9 @@ summarise_discovery_and_restriction <- function(domains) {
   known_domains <- domains |>
     dplyr::filter(
       !is.na(.data$has_llms_txt),
-      .data$training_bots_blocked %in% known_bot_policy_values,
-      .data$search_bots_blocked %in% known_bot_policy_values,
-      .data$user_fetch_bots_blocked %in% known_bot_policy_values
+      .data$training_bots_restricted %in% known_grouped_restriction_values,
+      .data$search_bots_restricted %in% known_grouped_restriction_values,
+      .data$user_fetch_bots_restricted %in% known_grouped_restriction_values
     ) |>
     dplyr::mutate(
       discovery_signal = dplyr::if_else(
@@ -270,9 +226,9 @@ summarise_discovery_and_restriction <- function(domains) {
         "Does not publish /llms.txt"
       ) |>
         factor(levels = c("Publishes /llms.txt", "Does not publish /llms.txt")),
-      `Restricts training bots` = is_restrictive_policy(.data$training_bots_blocked),
-      `Restricts AI search bots` = is_restrictive_policy(.data$search_bots_blocked),
-      `Restricts user-fetch agents` = is_restrictive_policy(.data$user_fetch_bots_blocked)
+      `Restricts training bots` = is_restrictive_policy(.data$training_bots_restricted),
+      `Restricts AI search bots` = is_restrictive_policy(.data$search_bots_restricted),
+      `Restricts user-fetch agents` = is_restrictive_policy(.data$user_fetch_bots_restricted)
     )
 
   signal_levels <- c(
@@ -302,52 +258,5 @@ summarise_discovery_and_restriction <- function(domains) {
         "Rows with known /llms.txt status and known training, AI-search,",
         "and user-fetch policy summaries."
       )
-    )
-}
-
-#' Summarise overlapping Cloudflare category memberships.
-summarise_categories <- function(categories, min_domains = 500) {
-  if (!"overlapping_category" %in% names(categories)) {
-    stop(
-      "`categories` must include an `overlapping_category` column from expand_categories().",
-      call. = FALSE
-    )
-  }
-
-  categories |>
-    dplyr::group_by(.data$overlapping_category) |>
-    dplyr::summarise(
-      category_membership_count = dplyr::n_distinct(.data$domain),
-      known_llms_results = sum(!is.na(.data$has_llms_txt)),
-      llms_txt_observed_count = sum(.data$has_llms_txt %in% TRUE),
-      training_policy_known = count_known_policy(.data$training_bots_blocked),
-      training_restrictive_count = count_restrictive_policy(.data$training_bots_blocked),
-      search_policy_known = count_known_policy(.data$search_bots_blocked),
-      search_restrictive_count = count_restrictive_policy(.data$search_bots_blocked),
-      user_fetch_policy_known = count_known_policy(.data$user_fetch_bots_blocked),
-      user_fetch_restrictive_count = count_restrictive_policy(.data$user_fetch_bots_blocked),
-      .groups = "drop"
-    ) |>
-    dplyr::filter(.data$category_membership_count >= min_domains) |>
-    dplyr::mutate(
-      min_domains = min_domains,
-      llms_txt_rate = rate_or_na(.data$llms_txt_observed_count, .data$known_llms_results),
-      training_restrictive_rate = rate_or_na(
-        .data$training_restrictive_count,
-        .data$training_policy_known
-      ),
-      search_restrictive_rate = rate_or_na(
-        .data$search_restrictive_count,
-        .data$search_policy_known
-      ),
-      user_fetch_restrictive_rate = rate_or_na(
-        .data$user_fetch_restrictive_count,
-        .data$user_fetch_policy_known
-      )
-    ) |>
-    dplyr::arrange(
-      dplyr::desc(.data$category_membership_count),
-      dplyr::desc(.data$llms_txt_rate),
-      .data$overlapping_category
     )
 }
