@@ -39,7 +39,7 @@ CHECKPOINT_PATH = REPO_ROOT / "data/raw/domains_checkpoint.jsonl"
 CHECKPOINT_META_PATH = REPO_ROOT / "data/raw/domains_checkpoint.meta.json"
 
 USER_AGENT = f"AIWebSignals/{VERSION} (+{REPOSITORY_URL})"
-DEFAULT_POPULARITY_BUCKET = 100000
+DEFAULT_POPULARITY_BUCKET = 50000
 DOMAIN_WORKERS = 30
 REQUEST_CONCURRENCY = 40
 LOG_EVERY = 500
@@ -1118,9 +1118,7 @@ async def process_domain(
         try:
             result = await task
         except Exception:
-            LOGGER.exception(
-                "Unexpected failure fetching %s for %s", name, item.domain
-            )
+            LOGGER.exception("Unexpected failure fetching %s for %s", name, item.domain)
             result = FetchResult(
                 None, None, b"", "internal_error", "https", None, 0, False, 0, 0
             )
@@ -1333,7 +1331,7 @@ def checkpoint_metadata(
         "input_filename": input_path.name,
         "input_sha256": input_digest,
         "input_row_count": input_row_count,
-        "source_population": "cloudflare_radar_top_100000_unordered_bucket",
+        "source_population": "cloudflare_radar_top_50000_unordered_bucket",
         "popularity_bucket": DEFAULT_POPULARITY_BUCKET,
         "tracked_agent_taxonomy": taxonomy,
         "tracked_agent_taxonomy_digest": stable_digest(taxonomy),
