@@ -657,7 +657,6 @@ async def fetch_once(
 
 def should_http_fallback(result: FetchResult) -> bool:
     return result.status is None and result.error_type in {
-        "connect_timeout",
         "connect_error",
         "tls_error",
     }
@@ -1411,6 +1410,7 @@ async def collect(
     status_counts: Counter[str] = Counter()
     endpoint_counts: Counter[str] = Counter()
     last_progress = time.monotonic()
+    last_progress_processed = 0
 
     if pending:
         timeout = httpx.Timeout(
@@ -1509,18 +1509,27 @@ async def collect(
                         rate = processed_this_run / max(
                             time.perf_counter() - started, 0.1
                         )
+                        interval_elapsed = max(now - last_progress, 0.1)
+                        interval_processed = (
+                            processed_this_run - last_progress_processed
+                        )
+                        interval_rate = interval_processed / interval_elapsed
                         LOGGER.info(
                             "Processed %s / %s pending | complete=%s partial=%s "
-                            "failed=%s | retries=%s | %.2f domains/s",
+                            "failed=%s | retries=%s fallbacks=%s | "
+                            "%.2f recent domains/s | %.2f avg domains/s",
                             processed_this_run,
                             len(pending),
                             status_counts["complete"],
                             status_counts["partial"],
                             status_counts["failed"],
                             stats.retries,
+                            stats.http_fallbacks,
+                            interval_rate,
                             rate,
                         )
                         last_progress = now
+                        last_progress_processed = processed_this_run
 
             await input_queue.join()
             await result_queue.join()
