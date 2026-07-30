@@ -112,7 +112,7 @@ collector intentionally accepts only the input path as a CLI argument.
 Each successful run atomically replaces the previous processed CSV. The
 collector does not write checkpoint or metadata files.
 
-Defaults favor a one-shot collection: 75 domain workers, 120 concurrent HTTP
+Defaults favor a one-shot collection: 50 domain workers, 50 concurrent HTTP
 requests, 3-second connect timeout, 5-second read timeout, and no retries.
 
 ## Collection Scope
@@ -134,7 +134,8 @@ Network behavior:
 - bounded worker and request concurrency;
 - explicit connect, read, write, and pool timeouts;
 - HTTPS first;
-- HTTP fallback only after selected non-timeout connection or TLS failures;
+- HTTP fallback only after selected pre-response connection, protocol, timeout,
+  or TLS failures;
 - no HTTP fallback after an HTTP response or application-level result;
 - HTTP/HTTPS redirects only, with a redirect limit;
 - redirect targets screened for credentials and unsafe address classes;
@@ -145,6 +146,32 @@ Network behavior:
 
 The redirect DNS safety cache is a practical defense, not a proof against every
 DNS-rebinding race inside the HTTP stack.
+
+Diagnostic commands:
+
+```bash
+uv run python collection/diagnose.py spot-check \
+  --output data/diagnostics/spot_check.csv \
+  --concurrency 10 \
+  --total-timeout 15
+```
+
+```bash
+uv run python collection/diagnose.py concurrency-sweep \
+  --output data/diagnostics/concurrency_sweep.csv \
+  --concurrency 5 10 25 50
+```
+
+```bash
+uv run python collection/diagnose.py sample-scan \
+  --sample-size 500 \
+  --concurrency 25 \
+  --output data/diagnostics/sample_scan_500.csv
+```
+
+Diagnostics sample from the existing processed CSV with a fixed seed by
+default. They write separate files under `data/diagnostics/` and do not replace
+the final processed CSV.
 
 ## Processed CSV
 
@@ -169,24 +196,11 @@ Exact ordered schema:
 | `has_llms_txt` | logical | yes | `true`, `false`, blank | True only for plausible observed `/llms.txt`; blank when unresolved. |
 | `llms_txt_status` | character | no | see endpoint enums | `/llms.txt` endpoint classification. |
 | `robots_txt_status` | character | no | see endpoint enums | `/robots.txt` endpoint classification. |
-| `has_explicit_ai_policy` | logical | yes | `true`, `false`, blank | Whether any tracked policy came from an explicit matching group. |
+| `has_explicit_ai_policy` | logical | yes | `true`, `false`, blank | Whether any tracked AI bot is explicitly addressed. |
+| `any_ai_bot_restricted` | logical | yes | `true`, `false`, blank | Whether any tracked AI bot in any group is restricted. |
 | `training_bots_restricted` | character | no | see grouped enum | Restriction summary for training/control tokens. |
 | `search_bots_restricted` | character | no | see grouped enum | Restriction summary for search/indexing agents. |
 | `user_fetch_bots_restricted` | character | no | see grouped enum | Restriction summary for user-triggered agents. |
-| `gpt_bot_policy` | character | no | see policy enum | Policy for `GPTBot`. |
-| `claude_bot_policy` | character | no | see policy enum | Policy for `ClaudeBot`. |
-| `google_extended_policy` | character | no | see policy enum | Policy for `Google-Extended`. |
-| `applebot_extended_policy` | character | no | see policy enum | Policy for `Applebot-Extended`. |
-| `meta_external_agent_policy` | character | no | see policy enum | Policy for `meta-externalagent`. |
-| `oai_search_bot_policy` | character | no | see policy enum | Policy for `OAI-SearchBot`. |
-| `claude_search_bot_policy` | character | no | see policy enum | Policy for `Claude-SearchBot`. |
-| `perplexity_bot_policy` | character | no | see policy enum | Policy for `PerplexityBot`. |
-| `duck_assist_bot_policy` | character | no | see policy enum | Policy for `DuckAssistBot`. |
-| `mistral_ai_index_policy` | character | no | see policy enum | Policy for `MistralAI-Index`. |
-| `chatgpt_user_policy` | character | no | see policy enum | Policy for `ChatGPT-User`. |
-| `claude_user_policy` | character | no | see policy enum | Policy for `Claude-User`. |
-| `perplexity_user_policy` | character | no | see policy enum | Policy for `Perplexity-User`. |
-| `mistral_ai_user_policy` | character | no | see policy enum | Policy for `MistralAI-User`. |
 | `scan_status` | character | no | `complete`, `partial`, `failed` | Overall endpoint completion status. |
 
 Boolean fields use lowercase `true` and `false`; unknown booleans are unquoted
@@ -216,9 +230,8 @@ types, duplicates, accidental index columns, parsing problems, or enum values do
 not match the schema.
 
 The Python writer also validates exact column order, unique snake-case names,
-valid logical/status/policy values, per-agent `_policy` suffixes, duplicate
-domains, absence of rank/index columns, scalar cells, and output row count
-before atomically replacing the CSV.
+valid logical/status/grouped values, duplicate domains, absence of rank/index
+columns, scalar cells, and output row count before atomically replacing the CSV.
 
 ### Endpoint Statuses
 
@@ -254,9 +267,12 @@ network_error
 `robots.txt` classifications describe declared policy shape, not verified
 path-level access or provider compliance.
 
-### Per-Agent Policy Enum
+### Internal Policy Enum
 
-Each per-agent policy column uses:
+The scanner parses per-agent policy values internally before collapsing them to
+the public grouped fields. The public dataset intentionally omits per-agent
+policy columns because it is designed for aggregate analysis and reporting, not
+per-agent policy comparison. Internal policy values use:
 
 ```text
 allow_default
@@ -300,29 +316,37 @@ unknown
 
 Partial and full restrictions both count as restricted. `all` means all tracked
 agents in that group have some declared restriction; it does not necessarily
-mean every path is blocked. `unknown` remains distinct from `none`.
+mean every path is blocked. `none` means all tracked bots in the group are known
+and none are restricted. `some` means at least one tracked bot is restricted and
+at least one is not restricted. `unknown` remains distinct from `none` and means
+the group could not be reliably determined.
 
-`has_explicit_ai_policy` reports whether any tracked policy came from an explicit
-agent group.
+`any_ai_bot_restricted` is `true` when at least one tracked AI bot in any group
+is restricted, `false` when all tracked groups are known and unrestricted, and
+blank when the result cannot be determined.
+
+`has_explicit_ai_policy` reports whether any tracked AI bot was explicitly named
+by a robots group. A generic `User-agent: *` rule is not counted as an explicit
+AI policy.
 
 ## Tracked Agents
 
-| token | purpose_group | processed_column |
-| --- | --- | --- |
-| `GPTBot` | training | `gpt_bot_policy` |
-| `ClaudeBot` | training | `claude_bot_policy` |
-| `Google-Extended` | training/control token | `google_extended_policy` |
-| `Applebot-Extended` | training/control token | `applebot_extended_policy` |
-| `meta-externalagent` | training | `meta_external_agent_policy` |
-| `OAI-SearchBot` | search/indexing | `oai_search_bot_policy` |
-| `Claude-SearchBot` | search/indexing | `claude_search_bot_policy` |
-| `PerplexityBot` | search/indexing | `perplexity_bot_policy` |
-| `DuckAssistBot` | search/indexing | `duck_assist_bot_policy` |
-| `MistralAI-Index` | search/indexing | `mistral_ai_index_policy` |
-| `ChatGPT-User` | user-triggered fetching | `chatgpt_user_policy` |
-| `Claude-User` | user-triggered fetching | `claude_user_policy` |
-| `Perplexity-User` | user-triggered fetching | `perplexity_user_policy` |
-| `MistralAI-User` | user-triggered fetching | `mistral_ai_user_policy` |
+| token | purpose_group |
+| --- | --- |
+| `GPTBot` | training |
+| `ClaudeBot` | training |
+| `Google-Extended` | training/control token |
+| `Applebot-Extended` | training/control token |
+| `meta-externalagent` | training |
+| `OAI-SearchBot` | search/indexing |
+| `Claude-SearchBot` | search/indexing |
+| `PerplexityBot` | search/indexing |
+| `DuckAssistBot` | search/indexing |
+| `MistralAI-Index` | search/indexing |
+| `ChatGPT-User` | user-triggered fetching |
+| `Claude-User` | user-triggered fetching |
+| `Perplexity-User` | user-triggered fetching |
+| `MistralAI-User` | user-triggered fetching |
 
 `Google-Extended` and `Applebot-Extended` are robots control tokens rather than
 standalone HTTP crawlers. The official Meta crawler URL is linked from
