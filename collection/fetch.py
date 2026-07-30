@@ -14,7 +14,7 @@ import sys
 import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urljoin, urlparse, urlunparse
@@ -24,7 +24,7 @@ from h2.exceptions import ProtocolError as H2ProtocolError
 
 LOGGER = logging.getLogger(__name__)
 
-VERSION = "3.4.0"
+VERSION = "3.4.1"
 REPOSITORY_URL = "https://github.com/derailable/ai-web-signals"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -33,8 +33,8 @@ OUTPUT_PATH = REPO_ROOT / "data/processed/domains.csv"
 
 USER_AGENT = f"AIWebSignals/{VERSION} (+{REPOSITORY_URL})"
 DEFAULT_POPULARITY_BUCKET = 100000
-DOMAIN_WORKERS = 75
-REQUEST_CONCURRENCY = 120
+DOMAIN_WORKERS = 50
+REQUEST_CONCURRENCY = 50
 PROGRESS_SECONDS = 300.0
 DEBUG_VALIDATE_ROWS = False
 REDIRECT_LIMIT = 4
@@ -44,6 +44,8 @@ CONNECT_TIMEOUT = 3.0
 READ_TIMEOUT = 5.0
 WRITE_TIMEOUT = 3.0
 POOL_TIMEOUT = 3.0
+REQUEST_RETRIES = 0
+RETRY_BACKOFF_BASE = 0.25
 DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 CHARSET_RE = re.compile(r"charset\s*=\s*[\"']?([^;\"'\s]+)", re.IGNORECASE)
 HTML_MARKUP_RE = re.compile(
@@ -94,29 +96,34 @@ SCAN_STATES = {"complete", "partial", "failed"}
 # DuckDuckGo: https://duckduckgo.com/duckduckgo-help-pages/results/duckassistbot
 # Meta official crawler doc was linked from Cloudflare Radar during review:
 # https://developers.facebook.com/docs/sharing/webmasters/web-crawlers
-TRAINING_BOTS = [
-    ("GPTBot", "gpt_bot_policy"),
-    ("ClaudeBot", "claude_bot_policy"),
-    ("Google-Extended", "google_extended_policy"),
-    ("Applebot-Extended", "applebot_extended_policy"),
-    ("meta-externalagent", "meta_external_agent_policy"),
+TRAINING_BOTS = (
+    "GPTBot",
+    "ClaudeBot",
+    "Google-Extended",
+    "Applebot-Extended",
+    "meta-externalagent",
+)
+SEARCH_BOTS = (
+    "OAI-SearchBot",
+    "Claude-SearchBot",
+    "PerplexityBot",
+    "DuckAssistBot",
+    "MistralAI-Index",
+)
+USER_FETCH_BOTS = (
+    "ChatGPT-User",
+    "Claude-User",
+    "Perplexity-User",
+    "MistralAI-User",
+)
+BOT_GROUPS = {
+    "training_bots_restricted": TRAINING_BOTS,
+    "search_bots_restricted": SEARCH_BOTS,
+    "user_fetch_bots_restricted": USER_FETCH_BOTS,
+}
+TRACKED_BOT_TOKENS = [
+    token for group_tokens in BOT_GROUPS.values() for token in group_tokens
 ]
-SEARCH_BOTS = [
-    ("OAI-SearchBot", "oai_search_bot_policy"),
-    ("Claude-SearchBot", "claude_search_bot_policy"),
-    ("PerplexityBot", "perplexity_bot_policy"),
-    ("DuckAssistBot", "duck_assist_bot_policy"),
-    ("MistralAI-Index", "mistral_ai_index_policy"),
-]
-USER_FETCH_BOTS = [
-    ("ChatGPT-User", "chatgpt_user_policy"),
-    ("Claude-User", "claude_user_policy"),
-    ("Perplexity-User", "perplexity_user_policy"),
-    ("MistralAI-User", "mistral_ai_user_policy"),
-]
-TRACKED_BOTS = TRAINING_BOTS + SEARCH_BOTS + USER_FETCH_BOTS
-TRACKED_BOT_TOKENS = [token for token, _column in TRACKED_BOTS]
-POLICY_COLUMNS = [column for _token, column in TRACKED_BOTS]
 UNKNOWN_ROBOTS_POLICIES = {token: "unknown" for token in TRACKED_BOT_TOKENS}
 ALLOW_DEFAULT_ROBOTS_POLICIES = {
     token: "allow_default" for token in TRACKED_BOT_TOKENS
@@ -128,10 +135,10 @@ OUTPUT_COLUMNS = [
     "llms_txt_status",
     "robots_txt_status",
     "has_explicit_ai_policy",
+    "any_ai_bot_restricted",
     "training_bots_restricted",
     "search_bots_restricted",
     "user_fetch_bots_restricted",
-    *POLICY_COLUMNS,
     "scan_status",
 ]
 
@@ -152,6 +159,8 @@ class CollectionSettings:
     llms_sample_limit: int = LLMS_SAMPLE_LIMIT
     robots_sample_limit: int = ROBOTS_SAMPLE_LIMIT
     redirect_limit: int = REDIRECT_LIMIT
+    request_retries: int = REQUEST_RETRIES
+    retry_backoff_base: float = RETRY_BACKOFF_BASE
 
 
 @dataclass(frozen=True)
@@ -167,6 +176,12 @@ class RequestStats:
     attempts: int = 0
     redirects: int = 0
     http_fallbacks: int = 0
+    http_fallback_recoveries: int = 0
+    retries: int = 0
+    retry_recoveries: int = 0
+    request_durations: list[float] = field(default_factory=list)
+    endpoint_statuses: Counter[str] = field(default_factory=Counter)
+    endpoint_error_reasons: Counter[str] = field(default_factory=Counter)
 
 
 class HostSafetyCache:
@@ -342,6 +357,8 @@ async def validate_url(url: str, safety_cache: HostSafetyCache) -> str | None:
 
 
 def classify_httpx_error(error: Exception) -> str:
+    if isinstance(error, H2ProtocolError):
+        return "protocol_error"
     if isinstance(error, httpx.ConnectTimeout):
         return "connect_timeout"
     if isinstance(error, httpx.ReadTimeout):
@@ -354,24 +371,51 @@ def classify_httpx_error(error: Exception) -> str:
         return "invalid_url"
     if isinstance(error, httpx.TooManyRedirects):
         return "redirect_error"
+    if isinstance(error, httpx.RemoteProtocolError):
+        return "protocol_error"
     if isinstance(error, httpx.ConnectError):
         description = repr(error).lower()
+        causes: list[BaseException] = []
         cause = error.__cause__
+        while cause is not None:
+            causes.append(cause)
+            cause = cause.__cause__
         if (
-            isinstance(cause, ssl.SSLError)
+            any(isinstance(cause, ssl.SSLError) for cause in causes)
             or "certificate" in description
             or "tls" in description
             or "ssl" in description
         ):
             return "tls_error"
         if (
-            isinstance(cause, socket.gaierror)
+            any(isinstance(cause, socket.gaierror) for cause in causes)
             or "name or service not known" in description
             or "nodename nor servname" in description
         ):
             return "dns_error"
-        return "connect_error"
-    return "network_error"
+        if any(isinstance(cause, ConnectionRefusedError) for cause in causes) or (
+            "connection refused" in description
+        ):
+            return "connection_refused"
+        if any(isinstance(cause, ConnectionResetError) for cause in causes) or (
+            "connection reset" in description
+        ):
+            return "connection_reset"
+        return "other_network_error"
+    return "other_network_error"
+
+
+def retryable_error_type(error_type: str | None) -> bool:
+    return error_type in {
+        "connect_timeout",
+        "read_timeout",
+        "write_timeout",
+        "pool_timeout",
+        "dns_error",
+        "connection_reset",
+        "other_network_error",
+        "protocol_error",
+    }
 
 
 async def read_limited(response: httpx.Response, limit: int) -> bytes:
@@ -419,40 +463,79 @@ async def fetch_once(
 
             async with semaphore:
                 stats.attempts += 1
+                attempt_started = time.perf_counter()
                 request = client.build_request("GET", redacted_url(current_url))
-                response = await client.send(request, stream=True)
+                try:
+                    response = await client.send(request, stream=True)
 
-                if 300 <= response.status_code < 400 and response.headers.get(
-                    "location"
-                ):
-                    location = response.headers["location"]
-                    await response.aclose()
-                    redirects += 1
-                    stats.redirects += 1
-                    if redirects > settings.redirect_limit:
-                        return FetchResult(None, None, b"", "redirect_error")
-                    current_url = urljoin(current_url, location)
-                    if urlparse(current_url).scheme not in {"http", "https"}:
-                        return FetchResult(None, None, b"", "unsafe_redirect")
-                    continue
+                    if 300 <= response.status_code < 400 and response.headers.get(
+                        "location"
+                    ):
+                        location = response.headers["location"]
+                        await response.aclose()
+                        redirects += 1
+                        stats.redirects += 1
+                        if redirects > settings.redirect_limit:
+                            return FetchResult(None, None, b"", "redirect_error")
+                        current_url = urljoin(current_url, location)
+                        if urlparse(current_url).scheme not in {"http", "https"}:
+                            return FetchResult(None, None, b"", "unsafe_redirect")
+                        continue
 
-                body = await read_limited(response, body_limit)
-                return FetchResult(
-                    response.status_code,
-                    response.headers.get("content-type"),
-                    body,
-                    None,
-                )
+                    body = await read_limited(response, body_limit)
+                    return FetchResult(
+                        response.status_code,
+                        response.headers.get("content-type"),
+                        body,
+                        None,
+                    )
+                finally:
+                    stats.request_durations.append(time.perf_counter() - attempt_started)
 
     except (httpx.HTTPError, H2ProtocolError) as error:
         return FetchResult(None, None, b"", classify_httpx_error(error))
 
-    return FetchResult(None, None, b"", "network_error")
+    return FetchResult(None, None, b"", "other_network_error")
+
+
+async def fetch_with_retries(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    safety_cache: HostSafetyCache,
+    stats: RequestStats,
+    url: str,
+    body_limit: int,
+    settings: CollectionSettings,
+) -> FetchResult:
+    last_result = await fetch_once(
+        client, semaphore, safety_cache, stats, url, body_limit, settings
+    )
+    if last_result.status is not None or not retryable_error_type(last_result.error_type):
+        return last_result
+
+    for retry_index in range(settings.request_retries):
+        stats.retries += 1
+        if settings.retry_backoff_base > 0:
+            await asyncio.sleep(settings.retry_backoff_base * (2**retry_index))
+        retry_result = await fetch_once(
+            client, semaphore, safety_cache, stats, url, body_limit, settings
+        )
+        if retry_result.status is not None:
+            stats.retry_recoveries += 1
+            return retry_result
+        last_result = retry_result
+        if not retryable_error_type(last_result.error_type):
+            return last_result
+    return last_result
 
 
 def should_http_fallback(result: FetchResult) -> bool:
     return result.status is None and result.error_type in {
-        "connect_error",
+        "connect_timeout",
+        "connection_refused",
+        "connection_reset",
+        "other_network_error",
+        "protocol_error",
         "tls_error",
     }
 
@@ -467,7 +550,7 @@ async def fetch_endpoint(
     body_limit: int,
     settings: CollectionSettings,
 ) -> FetchResult:
-    https_result = await fetch_once(
+    https_result = await fetch_with_retries(
         client,
         semaphore,
         safety_cache,
@@ -480,7 +563,7 @@ async def fetch_endpoint(
         return https_result
 
     stats.http_fallbacks += 1
-    http_result = await fetch_once(
+    http_result = await fetch_with_retries(
         client,
         semaphore,
         safety_cache,
@@ -489,6 +572,8 @@ async def fetch_endpoint(
         body_limit,
         settings,
     )
+    if http_result.status is not None:
+        stats.http_fallback_recoveries += 1
     return http_result
 
 
@@ -723,18 +808,42 @@ def has_llms_value(status: str) -> bool | None:
     return None
 
 
-def summarize_blocking(
-    policies: Mapping[str, str], bots: Sequence[tuple[str, str]]
-) -> str:
-    values = [policies.get(token, "unknown") for token, _column in bots]
+def policy_is_restricted(policy: str) -> bool:
+    return policy.startswith(("partial_", "blocked_"))
+
+
+def summarize_blocking(policies: Mapping[str, str], bots: Sequence[str]) -> str:
+    values = [policies.get(token, "unknown") for token in bots]
     if any(value == "unknown" for value in values):
         return "unknown"
-    restricted = sum(value.startswith(("partial_", "blocked_")) for value in values)
+    restricted = sum(policy_is_restricted(value) for value in values)
     if restricted == 0:
         return "none"
     if restricted == len(values):
         return "all"
     return "some"
+
+
+def any_ai_bot_restricted_value(
+    robots_status: str, policies: Mapping[str, str]
+) -> bool | None:
+    if robots_status not in {"parsed", "absent", "empty"}:
+        return None
+    values = [policies.get(token, "unknown") for token in TRACKED_BOT_TOKENS]
+    if any(value == "unknown" for value in values):
+        return None
+    return any(policy_is_restricted(value) for value in values)
+
+
+def has_explicit_ai_policy_value(
+    robots_status: str, policies: Mapping[str, str]
+) -> bool | None:
+    if robots_status not in {"parsed", "absent", "empty"}:
+        return None
+    values = [policies.get(token, "unknown") for token in TRACKED_BOT_TOKENS]
+    if any(value == "unknown" for value in values):
+        return None
+    return any(value.endswith("_explicit") for value in values)
 
 
 def scan_status_from_statuses(llms_status: str, robots_status: str) -> str:
@@ -760,17 +869,17 @@ def build_output_row(
         "has_llms_txt": has_llms_value(llms_status),
         "llms_txt_status": llms_status,
         "robots_txt_status": robots_status,
-        "has_explicit_ai_policy": (
-            any(str(value).endswith("_explicit") for value in policies.values())
-            if robots_status in {"parsed", "absent", "empty"}
-            else None
+        "has_explicit_ai_policy": has_explicit_ai_policy_value(
+            robots_status, policies
         ),
-        "training_bots_restricted": summarize_blocking(policies, TRAINING_BOTS),
-        "search_bots_restricted": summarize_blocking(policies, SEARCH_BOTS),
-        "user_fetch_bots_restricted": summarize_blocking(policies, USER_FETCH_BOTS),
+        "any_ai_bot_restricted": any_ai_bot_restricted_value(
+            robots_status, policies
+        ),
+        **{
+            column: summarize_blocking(policies, bots)
+            for column, bots in BOT_GROUPS.items()
+        },
     }
-    for token, column in TRACKED_BOTS:
-        row[column] = policies.get(token, "unknown")
     row["scan_status"] = scan_status_from_statuses(llms_status, robots_status)
     if DEBUG_VALIDATE_ROWS:
         validate_output_row(row)
@@ -824,8 +933,12 @@ async def process_domain(
 
         if name == "llms_txt":
             llms_status = classify_llms_txt(result)
+            stats.endpoint_statuses[f"llms_txt:{llms_status}"] += 1
         else:
             robots_status, robots_policies = classify_robots_txt(result)
+            stats.endpoint_statuses[f"robots_txt:{robots_status}"] += 1
+        if result.error_type:
+            stats.endpoint_error_reasons[f"{name}:{result.error_type}"] += 1
 
     return build_output_row(item.domain, llms_status, robots_status, robots_policies)
 
@@ -853,9 +966,8 @@ def validate_output_row(row: Mapping[str, Any]) -> None:
         raise ValueError("Output row has an invalid has_llms_txt value.")
     if row["has_explicit_ai_policy"] not in {True, False, None}:
         raise ValueError("Output row has an invalid has_explicit_ai_policy value.")
-    for column in POLICY_COLUMNS:
-        if row[column] not in POLICY_VALUES:
-            raise ValueError(f"Output row has an invalid {column} value.")
+    if row["any_ai_bot_restricted"] not in {True, False, None}:
+        raise ValueError("Output row has an invalid any_ai_bot_restricted value.")
 
 
 def validate_output_contract(
@@ -879,11 +991,6 @@ def validate_output_contract(
     }
     if forbidden_columns & set(OUTPUT_COLUMNS):
         raise ValueError("Output schema contains an index or rank-like column.")
-    if any(not column.endswith("_policy") for column in POLICY_COLUMNS):
-        raise ValueError("Per-agent policy columns must end with `_policy`.")
-    if len(set(POLICY_COLUMNS)) != len(POLICY_COLUMNS):
-        raise ValueError("Per-agent policy columns are not unique.")
-
     domain_values = [item.domain for item in domains]
     if len(set(domain_values)) != len(domain_values):
         raise ValueError("Input domains contain duplicates after normalization.")
@@ -927,6 +1034,45 @@ def write_output_csv(
 
     os.replace(temporary, OUTPUT_PATH)
     return count
+
+
+def percentile(values: Sequence[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    sorted_values = sorted(values)
+    index = min(
+        len(sorted_values) - 1,
+        max(0, round((len(sorted_values) - 1) * quantile)),
+    )
+    return sorted_values[index]
+
+
+def log_scan_summary(stats: RequestStats) -> None:
+    median_duration = percentile(stats.request_durations, 0.50)
+    p95_duration = percentile(stats.request_durations, 0.95)
+    LOGGER.info(
+        "HTTP attempts=%s redirects=%s http_fallbacks=%s "
+        "http_fallback_recoveries=%s retries=%s retry_recoveries=%s",
+        stats.attempts,
+        stats.redirects,
+        stats.http_fallbacks,
+        stats.http_fallback_recoveries,
+        stats.retries,
+        stats.retry_recoveries,
+    )
+    if median_duration is not None and p95_duration is not None:
+        LOGGER.info(
+            "Request duration median=%.3fs p95=%.3fs",
+            median_duration,
+            p95_duration,
+        )
+    if stats.endpoint_statuses:
+        LOGGER.info("Endpoint statuses: %s", dict(stats.endpoint_statuses.most_common()))
+    if stats.endpoint_error_reasons:
+        LOGGER.info(
+            "Network error reasons: %s",
+            dict(stats.endpoint_error_reasons.most_common()),
+        )
 
 
 async def collect(
@@ -1045,6 +1191,7 @@ async def collect(
             await asyncio.gather(*workers)
 
     write_output_csv(domains, latest_rows)
+    log_scan_summary(stats)
     return 0
 
 
