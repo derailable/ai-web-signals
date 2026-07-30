@@ -148,7 +148,7 @@ Network behavior:
 - bounded worker and request concurrency;
 - explicit connect, read, write, and pool timeouts;
 - HTTPS first;
-- HTTP fallback only after selected connection or TLS failures;
+- HTTP fallback only after selected non-timeout connection or TLS failures;
 - no HTTP fallback after an HTTP response or application-level result;
 - HTTP/HTTPS redirects only, with a redirect limit;
 - redirect targets screened for credentials and unsafe address classes;
