@@ -20,6 +20,7 @@ from typing import Any, Literal
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
+from h2.exceptions import ProtocolError as H2ProtocolError
 
 LOGGER = logging.getLogger(__name__)
 
@@ -443,7 +444,7 @@ async def fetch_once(
                     None,
                 )
 
-    except httpx.HTTPError as error:
+    except (httpx.HTTPError, H2ProtocolError) as error:
         return FetchResult(None, None, b"", classify_httpx_error(error))
 
     return FetchResult(None, None, b"", "network_error")
@@ -689,7 +690,6 @@ def classify_robots_txt(result: FetchResult) -> tuple[str, dict[str, str]]:
     try:
         groups, saw_supported_field = parse_robots_groups(text)
     except Exception:
-        LOGGER.exception("Unexpected robots parser failure")
         return "unparseable", UNKNOWN_ROBOTS_POLICIES
 
     if not saw_supported_field:
@@ -820,7 +820,6 @@ async def process_domain(
         try:
             result = await task
         except Exception:
-            LOGGER.exception("Unexpected failure fetching %s for %s", name, item.domain)
             result = FetchResult(None, None, b"", "internal_error")
 
         if name == "llms_txt":
@@ -938,14 +937,8 @@ async def collect(
     latest_rows: dict[str, dict[str, Any]] = {}
     pending = list(domains)
 
-    LOGGER.info(
-        "Loaded %s domains for a fresh one-shot collection.",
-        len(domains),
-    )
-
     stats = RequestStats()
     processed_this_run = 0
-    status_counts: Counter[str] = Counter()
     last_progress = time.monotonic()
     last_progress_processed = 0
 
@@ -1005,9 +998,6 @@ async def collect(
                             )
                             await result_queue.put(row)
                         except Exception:
-                            LOGGER.exception(
-                                "Unexpected failure scanning %s", item.domain
-                            )
                             await result_queue.put(
                                 build_output_row(
                                     item.domain,
@@ -1027,7 +1017,6 @@ async def collect(
                 try:
                     latest_rows[str(row["domain"])] = row
                     processed_this_run += 1
-                    status_counts[str(row["scan_status"])] += 1
                 finally:
                     result_queue.task_done()
 
@@ -1055,23 +1044,7 @@ async def collect(
             await producer_task
             await asyncio.gather(*workers)
 
-    row_count = write_output_csv(domains, latest_rows)
-    final_counts = status_counts
-
-    LOGGER.info("Wrote %s rows to %s", row_count, OUTPUT_PATH)
-    LOGGER.info(
-        "Final scan status: complete=%s partial=%s failed=%s",
-        final_counts["complete"],
-        final_counts["partial"],
-        final_counts["failed"],
-    )
-    LOGGER.info(
-        "HTTP attempts=%s redirects=%s fallbacks=%s elapsed=%.1fs",
-        stats.attempts,
-        stats.redirects,
-        stats.http_fallbacks,
-        time.perf_counter() - started,
-    )
+    write_output_csv(domains, latest_rows)
     return 0
 
 
@@ -1092,16 +1065,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     try:
-        domains, skipped = load_domains(input_path)
+        domains, _skipped = load_domains(input_path)
         if not domains:
             raise ValueError(f"No valid domains found in {input_path}")
-        if skipped:
-            LOGGER.info(
-                "Skipped %s input rows: %s",
-                sum(skipped.values()),
-                ", ".join(f"{reason}={count}" for reason, count in skipped.items()),
-            )
-
         return asyncio.run(collect(domains, CollectionSettings()))
     except KeyboardInterrupt:
         LOGGER.warning("Interrupted. Re-run the command to start a fresh collection.")
