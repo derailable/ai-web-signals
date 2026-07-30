@@ -1,7 +1,7 @@
 # ai-web-signals
 
 `ai-web-signals` measures a narrow set of public web signals across
-Cloudflare Radar's Top 50,000 domain population:
+Cloudflare Radar's Top 100,000 domain population:
 
 1. whether a plausible `/llms.txt` is published;
 2. how `/robots.txt` declares policy for documented AI-related agents; and
@@ -21,7 +21,6 @@ Generated data and rendered outputs are local-only:
 
 ```text
 data/input/
-data/raw/
 data/processed/
 results/tables/
 results/figures/
@@ -29,7 +28,7 @@ _site/
 ```
 
 Keep original source files under `data/input/` for local provenance. Do not
-commit collected checkpoint files, processed CSVs, figures, or rendered reports.
+commit processed CSVs, figures, or rendered reports.
 
 ## Data Source
 
@@ -39,13 +38,12 @@ workflow for this study. A Cloudflare API token is not required.
 Cloudflare documents two different domain datasets:
 
 - the ordered Top 100 list; and
-- unordered popularity bucket datasets, including Top 50,000.
+- unordered popularity bucket datasets, including Top 100,000.
 
-For this project, the ordinary Top 50,000 CSV is treated as an unordered
+For this project, the ordinary Top 100,000 CSV is treated as an unordered
 popularity bucket. Do not treat row order as rank, manufacture sequential ranks,
 or make rank-band claims from this file. The processed CSV intentionally omits
-rank and bucket columns; source-population provenance is retained in checkpoint
-metadata.
+rank and bucket columns.
 
 Official source reference:
 <https://developers.cloudflare.com/radar/investigate/domain-ranking-datasets/>
@@ -58,7 +56,7 @@ The collector accepts UTF-8 CSV input with a domain column:
 | --- | --- | --- | --- |
 | `domain` | Yes | `hostname`, `host`, one unambiguous `*domain*` column | Normalized with IDNA, lowercased, trailing dot removed, validated, and deduplicated |
 
-An input `rank` or `ranking` column is ignored for the Top 50,000 bucket unless
+An input `rank` or `ranking` column is ignored for the Top 100,000 bucket unless
 the collection method is later changed to a provenance-backed ordered Cloudflare
 Top 100 source. A single `domain` column remains sufficient.
 
@@ -99,34 +97,22 @@ RENV_CONFIG_SANDBOX_ENABLED=FALSE Rscript -e 'renv::restore()'
 Set the input path:
 
 ```bash
-INPUT=data/input/cloudflare-radar_top-50000-domains_YYYYMMDD-YYYYMMDD.csv
+INPUT=data/input/cloudflare-radar_top-100000-domains_YYYYMMDD-YYYYMMDD.csv
 ```
 
-Run a 100-domain smoke collection:
-
-```bash
-uv run python collection/fetch.py "$INPUT" --limit 100
-```
-
-Run the full Top 50,000 collection:
+Run the full Top 100,000 collection:
 
 ```bash
 uv run python collection/fetch.py "$INPUT"
 ```
 
-Each run starts fresh and replaces the previous checkpoint and processed CSV.
+For a smoke collection, pass a smaller temporary CSV as the input file. The
+collector intentionally accepts only the input path as a CLI argument.
 
-Operational options:
+Each successful run atomically replaces the previous processed CSV. The
+collector does not write checkpoint or metadata files.
 
-```text
---limit N
---workers N
---request-concurrency N
---connect-timeout SECONDS
---read-timeout SECONDS
-```
-
-Defaults favor a one-shot collection: 50 domain workers, 80 concurrent HTTP
+Defaults favor a one-shot collection: 75 domain workers, 120 concurrent HTTP
 requests, 3-second connect timeout, 5-second read timeout, and no retries.
 
 ## Collection Scope
@@ -144,7 +130,7 @@ fingerprints, or additional external APIs.
 
 Network behavior:
 
-- one shared asynchronous `httpx` client;
+- one shared asynchronous `httpx` client with HTTP/2 enabled when supported;
 - bounded worker and request concurrency;
 - explicit connect, read, write, and pool timeouts;
 - HTTPS first;
@@ -153,7 +139,6 @@ Network behavior:
 - HTTP/HTTPS redirects only, with a redirect limit;
 - redirect targets screened for credentials and unsafe address classes;
 - bounded streaming body reads;
-- retries disabled by default;
 - TLS verification remains enabled; and
 - user agent:
   `AIWebSignals/<version> (+https://github.com/derailable/ai-web-signals)`.
@@ -359,45 +344,6 @@ First-party references:
 - DuckDuckGo: <https://duckduckgo.com/duckduckgo-help-pages/results/duckassistbot>
 - Meta crawler URL: <https://developers.facebook.com/docs/sharing/webmasters/web-crawlers>
 
-## Checkpoint
-
-Checkpoint files:
-
-```text
-data/raw/domains_checkpoint.jsonl
-data/raw/domains_checkpoint.meta.json
-```
-
-The JSONL checkpoint is an internal record for the current one-shot collection,
-not a duplicate of the analysis CSV. It is recreated at the start of every run
-and preserves compact endpoint evidence:
-
-```text
-attempted
-completed
-requested_scheme
-final_scheme
-http_status
-content_type
-bytes_read
-body_truncated
-redirect_count
-retry_count
-error_type
-classification
-fetched_at
-```
-
-It also preserves final per-agent robots classifications. It does not store
-response bodies, cookies, arbitrary headers, credentials, secrets, full
-exception strings, or final URLs with query strings.
-
-The metadata records schema version, collector version, input filename, input
-SHA-256, input row count, source population, popularity bucket, tracked-agent
-taxonomy digest, collection settings digest, start time, completion time, and
-final status counts. Successful completion compacts the checkpoint atomically to
-one record per domain.
-
 ## Analysis
 
 Load the processed CSV from R:
@@ -417,7 +363,7 @@ publication narrative belong in the R/Quarto phase after the full collection.
 
 ## Limitations
 
-- Cloudflare Top 50,000 bucket membership is coarse popularity evidence, not an
+- Cloudflare Top 100,000 bucket membership is coarse popularity evidence, not an
   exact rank.
 - `robots.txt` is a declared crawler policy mechanism, not access control.
 - User-agent strings can be spoofed.

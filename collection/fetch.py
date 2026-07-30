@@ -2,48 +2,40 @@
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import csv
-import email.utils
-import hashlib
 import ipaddress
-import json
 import logging
 import os
-import random
 import re
 import socket
 import ssl
+import sys
 import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, TextIO
+from typing import Any, Literal
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
 
 LOGGER = logging.getLogger(__name__)
 
-VERSION = "3.3.0"
-SCHEMA_VERSION = 6
+VERSION = "3.4.0"
 REPOSITORY_URL = "https://github.com/derailable/ai-web-signals"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "collection" else SCRIPT_DIR
 OUTPUT_PATH = REPO_ROOT / "data/processed/domains.csv"
-CHECKPOINT_PATH = REPO_ROOT / "data/raw/domains_checkpoint.jsonl"
-CHECKPOINT_META_PATH = REPO_ROOT / "data/raw/domains_checkpoint.meta.json"
 
 USER_AGENT = f"AIWebSignals/{VERSION} (+{REPOSITORY_URL})"
-DEFAULT_POPULARITY_BUCKET = 50000
-DOMAIN_WORKERS = 50
-REQUEST_CONCURRENCY = 80
-LOG_EVERY = 500
-PROGRESS_SECONDS = 30.0
+DEFAULT_POPULARITY_BUCKET = 100000
+DOMAIN_WORKERS = 75
+REQUEST_CONCURRENCY = 120
+PROGRESS_SECONDS = 300.0
+DEBUG_VALIDATE_ROWS = False
 REDIRECT_LIMIT = 4
 LLMS_SAMPLE_LIMIT = 256 * 1024
 ROBOTS_SAMPLE_LIMIT = 512 * 1024
@@ -51,9 +43,11 @@ CONNECT_TIMEOUT = 3.0
 READ_TIMEOUT = 5.0
 WRITE_TIMEOUT = 3.0
 POOL_TIMEOUT = 3.0
-RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-RETRY_DELAYS: tuple[float, ...] = ()
-MAX_RETRY_AFTER_SECONDS = 3.0
+DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+CHARSET_RE = re.compile(r"charset\s*=\s*[\"']?([^;\"'\s]+)", re.IGNORECASE)
+HTML_MARKUP_RE = re.compile(
+    r"<(?:title|div|span|script|style|meta|form|nav|footer)\b"
+)
 
 EndpointName = Literal["llms_txt", "robots_txt"]
 
@@ -122,6 +116,10 @@ USER_FETCH_BOTS = [
 TRACKED_BOTS = TRAINING_BOTS + SEARCH_BOTS + USER_FETCH_BOTS
 TRACKED_BOT_TOKENS = [token for token, _column in TRACKED_BOTS]
 POLICY_COLUMNS = [column for _token, column in TRACKED_BOTS]
+UNKNOWN_ROBOTS_POLICIES = {token: "unknown" for token in TRACKED_BOT_TOKENS}
+ALLOW_DEFAULT_ROBOTS_POLICIES = {
+    token: "allow_default" for token in TRACKED_BOT_TOKENS
+}
 
 OUTPUT_COLUMNS = [
     "domain",
@@ -139,7 +137,6 @@ OUTPUT_COLUMNS = [
 
 @dataclass(frozen=True)
 class DomainInput:
-    popularity_bucket: int
     domain: str
 
 
@@ -154,58 +151,6 @@ class CollectionSettings:
     llms_sample_limit: int = LLMS_SAMPLE_LIMIT
     robots_sample_limit: int = ROBOTS_SAMPLE_LIMIT
     redirect_limit: int = REDIRECT_LIMIT
-    retry_delays: tuple[float, ...] = RETRY_DELAYS
-    max_retry_after_seconds: float = MAX_RETRY_AFTER_SECONDS
-
-    def as_metadata(self) -> dict[str, Any]:
-        return {
-            "workers": self.workers,
-            "request_concurrency": self.request_concurrency,
-            "connect_timeout": self.connect_timeout,
-            "read_timeout": self.read_timeout,
-            "write_timeout": self.write_timeout,
-            "pool_timeout": self.pool_timeout,
-            "llms_sample_limit": self.llms_sample_limit,
-            "robots_sample_limit": self.robots_sample_limit,
-            "redirect_limit": self.redirect_limit,
-            "retryable_status_codes": sorted(RETRYABLE_STATUS_CODES),
-            "retry_delays": list(self.retry_delays),
-            "max_retry_after_seconds": self.max_retry_after_seconds,
-        }
-
-
-@dataclass(frozen=True)
-class EndpointEvidence:
-    attempted: bool
-    completed: bool
-    requested_scheme: str | None
-    final_scheme: str | None
-    http_status: int | None
-    content_type: str | None
-    bytes_read: int
-    body_truncated: bool
-    redirect_count: int
-    retry_count: int
-    error_type: str | None
-    classification: str
-    fetched_at: str | None
-
-    def to_json(self) -> dict[str, Any]:
-        return {
-            "attempted": self.attempted,
-            "completed": self.completed,
-            "requested_scheme": self.requested_scheme,
-            "final_scheme": self.final_scheme,
-            "http_status": self.http_status,
-            "content_type": self.content_type,
-            "bytes_read": self.bytes_read,
-            "body_truncated": self.body_truncated,
-            "redirect_count": self.redirect_count,
-            "retry_count": self.retry_count,
-            "error_type": self.error_type,
-            "classification": self.classification,
-            "fetched_at": self.fetched_at,
-        }
 
 
 @dataclass(frozen=True)
@@ -214,18 +159,11 @@ class FetchResult:
     content_type: str | None
     body: bytes
     error_type: str | None
-    requested_scheme: str
-    final_scheme: str | None
-    bytes_read: int
-    body_truncated: bool
-    redirect_count: int
-    retry_count: int
 
 
 @dataclass
 class RequestStats:
     attempts: int = 0
-    retries: int = 0
     redirects: int = 0
     http_fallbacks: int = 0
 
@@ -233,57 +171,47 @@ class RequestStats:
 class HostSafetyCache:
     """Bounded DNS safety cache for practical redirect target screening.
 
-    This checks all resolved addresses before each request and reuses one task per
-    host. It does not prove DNS-rebinding safety inside httpx's connection layer.
+    This checks all resolved addresses before each request and caches completed
+    results. It does not prove DNS-rebinding safety inside httpx's connection
+    layer.
     """
 
-    def __init__(self, max_entries: int = 50000) -> None:
+    def __init__(self, max_entries: int = DEFAULT_POPULARITY_BUCKET) -> None:
+        self._results: dict[str, str | None] = {}
         self._tasks: dict[str, asyncio.Task[str | None]] = {}
         self._max_entries = max_entries
 
+    def _evict_one(self) -> None:
+        if self._results:
+            self._results.pop(next(iter(self._results)))
+        elif self._tasks:
+            self._tasks.pop(next(iter(self._tasks)))
+
     async def check(self, host: str) -> str | None:
         key = host.lower().rstrip(".")
+        if key in self._results:
+            return self._results[key]
+
         task = self._tasks.get(key)
         if task is None:
-            if len(self._tasks) >= self._max_entries:
-                self._tasks.pop(next(iter(self._tasks)))
+            if len(self._results) + len(self._tasks) >= self._max_entries:
+                self._evict_one()
             task = asyncio.create_task(asyncio.to_thread(resolve_host_safety, key))
             self._tasks[key] = task
         try:
-            return await asyncio.shield(task)
+            result = await asyncio.shield(task)
         except asyncio.CancelledError:
             raise
         except Exception:
             if self._tasks.get(key) is task:
                 self._tasks.pop(key, None)
             raise
-
-
-def utc_now_iso() -> str:
-    return datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
-def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def count_csv_data_rows(path: Path) -> int:
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.reader(handle)
-        try:
-            next(reader)
-        except StopIteration:
-            return 0
-        return sum(1 for _row in reader)
-
-
-def stable_digest(value: Any) -> str:
-    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
+        if self._tasks.get(key) is task:
+            self._tasks.pop(key, None)
+            if len(self._results) + len(self._tasks) >= self._max_entries:
+                self._evict_one()
+            self._results[key] = result
+        return result
 
 
 def normalize_domain(raw: str) -> tuple[str | None, str | None]:
@@ -308,8 +236,9 @@ def normalize_domain(raw: str) -> tuple[str | None, str | None]:
         return None, "domain is too long"
 
     labels = value.split(".")
-    label_pattern = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
-    if len(labels) < 2 or not all(label_pattern.fullmatch(label) for label in labels):
+    if len(labels) < 2 or not all(
+        DOMAIN_LABEL_RE.fullmatch(label) for label in labels
+    ):
         return None, "contains an invalid DNS label"
 
     try:
@@ -340,11 +269,7 @@ def identify_domain_column(fieldnames: Sequence[str]) -> str:
     )
 
 
-def load_domains(
-    path: Path,
-    limit: int | None,
-    popularity_bucket: int = DEFAULT_POPULARITY_BUCKET,
-) -> tuple[list[DomainInput], Counter[str]]:
+def load_domains(path: Path) -> tuple[list[DomainInput], Counter[str]]:
     domains: list[DomainInput] = []
     skipped: Counter[str] = Counter()
     seen: set[str] = set()
@@ -365,13 +290,8 @@ def load_domains(
                 skipped["duplicate after normalization"] += 1
                 continue
             seen.add(normalized)
-            domains.append(
-                DomainInput(
-                    popularity_bucket=popularity_bucket,
-                    domain=normalized,
-                )
-            )
-            if limit is not None and len(domains) >= limit:
+            domains.append(DomainInput(domain=normalized))
+            if len(domains) >= DEFAULT_POPULARITY_BUCKET:
                 break
 
     return domains, skipped
@@ -453,38 +373,9 @@ def classify_httpx_error(error: Exception) -> str:
     return "network_error"
 
 
-def should_retry_exception(error: Exception) -> bool:
-    return isinstance(
-        error,
-        (
-            httpx.ConnectTimeout,
-            httpx.ReadTimeout,
-            httpx.PoolTimeout,
-            httpx.ConnectError,
-        ),
-    )
-
-
-def parse_retry_after(value: str | None, max_seconds: float) -> float | None:
-    if not value:
-        return None
-    text = value.strip()
-    if text.isdigit():
-        return min(float(text), max_seconds)
-    try:
-        parsed = email.utils.parsedate_to_datetime(text)
-    except (TypeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    seconds = (parsed - datetime.now(UTC)).total_seconds()
-    return min(max(seconds, 0.0), max_seconds)
-
-
-async def read_limited(response: httpx.Response, limit: int) -> tuple[bytes, bool]:
+async def read_limited(response: httpx.Response, limit: int) -> bytes:
     chunks: list[bytes] = []
     total = 0
-    truncated = False
     try:
         async for chunk in response.aiter_bytes():
             if not chunk:
@@ -492,12 +383,11 @@ async def read_limited(response: httpx.Response, limit: int) -> tuple[bytes, boo
             chunks.append(chunk)
             total += len(chunk)
             if total > limit:
-                truncated = True
                 break
     finally:
         await response.aclose()
     body = b"".join(chunks)
-    return body[:limit], truncated
+    return body[:limit]
 
 
 def redacted_url(url: str) -> str:
@@ -517,142 +407,46 @@ async def fetch_once(
     body_limit: int,
     settings: CollectionSettings,
 ) -> FetchResult:
-    requested_scheme = urlparse(url).scheme
-    total_redirects = 0
-    total_retries = 0
+    current_url = url
+    redirects = 0
 
-    for attempt in range(len(settings.retry_delays) + 1):
-        current_url = url
-        redirects_this_attempt = 0
-        retry_delay: float | None = None
+    try:
+        while True:
+            safety_error = await validate_url(current_url, safety_cache)
+            if safety_error:
+                return FetchResult(None, None, b"", safety_error)
 
-        try:
-            while True:
-                safety_error = await validate_url(current_url, safety_cache)
-                if safety_error:
-                    return FetchResult(
-                        None,
-                        None,
-                        b"",
-                        safety_error,
-                        requested_scheme,
-                        urlparse(current_url).scheme or None,
-                        0,
-                        False,
-                        total_redirects,
-                        total_retries,
-                    )
-
-                async with semaphore:
-                    stats.attempts += 1
-                    request = client.build_request("GET", redacted_url(current_url))
-                    response = await client.send(request, stream=True)
+            async with semaphore:
+                stats.attempts += 1
+                request = client.build_request("GET", redacted_url(current_url))
+                response = await client.send(request, stream=True)
 
                 if 300 <= response.status_code < 400 and response.headers.get(
                     "location"
                 ):
                     location = response.headers["location"]
                     await response.aclose()
-                    redirects_this_attempt += 1
-                    total_redirects += 1
+                    redirects += 1
                     stats.redirects += 1
-                    if redirects_this_attempt > settings.redirect_limit:
-                        return FetchResult(
-                            None,
-                            None,
-                            b"",
-                            "redirect_error",
-                            requested_scheme,
-                            urlparse(current_url).scheme or None,
-                            0,
-                            False,
-                            total_redirects,
-                            total_retries,
-                        )
+                    if redirects > settings.redirect_limit:
+                        return FetchResult(None, None, b"", "redirect_error")
                     current_url = urljoin(current_url, location)
                     if urlparse(current_url).scheme not in {"http", "https"}:
-                        return FetchResult(
-                            None,
-                            None,
-                            b"",
-                            "unsafe_redirect",
-                            requested_scheme,
-                            urlparse(current_url).scheme or None,
-                            0,
-                            False,
-                            total_redirects,
-                            total_retries,
-                        )
+                        return FetchResult(None, None, b"", "unsafe_redirect")
                     continue
 
-                if response.status_code in RETRYABLE_STATUS_CODES and attempt < len(
-                    settings.retry_delays
-                ):
-                    retry_after = parse_retry_after(
-                        response.headers.get("retry-after"),
-                        settings.max_retry_after_seconds,
-                    )
-                    await response.aclose()
-                    total_retries += 1
-                    stats.retries += 1
-                    retry_delay = (
-                        retry_after
-                        if retry_after is not None
-                        else settings.retry_delays[attempt] + random.uniform(0.0, 0.25)
-                    )
-                else:
-                    body, truncated = await read_limited(response, body_limit)
-                    return FetchResult(
-                        response.status_code,
-                        response.headers.get("content-type"),
-                        body,
-                        None,
-                        requested_scheme,
-                        urlparse(str(response.url)).scheme or None,
-                        len(body),
-                        truncated,
-                        total_redirects,
-                        total_retries,
-                    )
-                break
-
-        except httpx.HTTPError as error:
-            if attempt < len(settings.retry_delays) and should_retry_exception(error):
-                total_retries += 1
-                stats.retries += 1
-                await asyncio.sleep(
-                    settings.retry_delays[attempt] + random.uniform(0.0, 0.25)
+                body = await read_limited(response, body_limit)
+                return FetchResult(
+                    response.status_code,
+                    response.headers.get("content-type"),
+                    body,
+                    None,
                 )
-                continue
-            return FetchResult(
-                None,
-                None,
-                b"",
-                classify_httpx_error(error),
-                requested_scheme,
-                urlparse(current_url).scheme or None,
-                0,
-                False,
-                total_redirects,
-                total_retries,
-            )
 
-        if retry_delay is not None:
-            await asyncio.sleep(retry_delay)
-            continue
+    except httpx.HTTPError as error:
+        return FetchResult(None, None, b"", classify_httpx_error(error))
 
-    return FetchResult(
-        None,
-        None,
-        b"",
-        "network_error",
-        requested_scheme,
-        requested_scheme,
-        0,
-        False,
-        total_redirects,
-        total_retries,
-    )
+    return FetchResult(None, None, b"", "network_error")
 
 
 def should_http_fallback(result: FetchResult) -> bool:
@@ -694,18 +488,7 @@ async def fetch_endpoint(
         body_limit,
         settings,
     )
-    return FetchResult(
-        http_result.status,
-        http_result.content_type,
-        http_result.body,
-        http_result.error_type,
-        "https",
-        http_result.final_scheme,
-        http_result.bytes_read,
-        http_result.body_truncated,
-        https_result.redirect_count + http_result.redirect_count,
-        https_result.retry_count + http_result.retry_count,
-    )
+    return http_result
 
 
 def looks_textual(data: bytes) -> bool:
@@ -723,9 +506,7 @@ def decode_text(data: bytes, content_type: str | None) -> str | None:
         return None
     charset: str | None = None
     if content_type:
-        match = re.search(
-            r"charset\s*=\s*[\"']?([^;\"'\s]+)", content_type, re.IGNORECASE
-        )
+        match = CHARSET_RE.search(content_type)
         if match:
             charset = match.group(1).lower()
     encodings = [charset] if charset else []
@@ -748,7 +529,7 @@ def looks_like_html(text: str) -> bool:
         any(
             marker in sample for marker in ("<!doctype html", "<html", "<head", "<body")
         )
-        or re.search(r"<(?:title|div|span|script|style|meta|form|nav|footer)\b", sample)
+        or HTML_MARKUP_RE.search(sample)
     )
 
 
@@ -885,83 +666,38 @@ def classify_bot_policy(groups: Sequence[Mapping[str, Any]], bot: str) -> str:
 
 
 def classify_robots_txt(result: FetchResult) -> tuple[str, dict[str, str]]:
-    unknown_policies = {token: "unknown" for token in TRACKED_BOT_TOKENS}
     if result.error_type:
-        return "network_error", unknown_policies
+        return "network_error", UNKNOWN_ROBOTS_POLICIES
     if result.status in {404, 410}:
-        return "absent", {token: "allow_default" for token in TRACKED_BOT_TOKENS}
+        return "absent", ALLOW_DEFAULT_ROBOTS_POLICIES
     if not is_success(result.status):
-        return "http_error", unknown_policies
+        return "http_error", UNKNOWN_ROBOTS_POLICIES
     if not result.body:
-        return "empty", {token: "allow_default" for token in TRACKED_BOT_TOKENS}
+        return "empty", ALLOW_DEFAULT_ROBOTS_POLICIES
     if not is_text_content_type(result.content_type):
-        return "non_text", unknown_policies
+        return "non_text", UNKNOWN_ROBOTS_POLICIES
     text = decode_text(result.body, result.content_type)
     if text is None:
-        return "non_text", unknown_policies
+        return "non_text", UNKNOWN_ROBOTS_POLICIES
     if looks_like_html(text):
-        return "html", unknown_policies
+        return "html", UNKNOWN_ROBOTS_POLICIES
     if not text.strip() or not any(
         strip_robots_comment(line).strip() for line in text.splitlines()
     ):
-        return "empty", {token: "allow_default" for token in TRACKED_BOT_TOKENS}
+        return "empty", ALLOW_DEFAULT_ROBOTS_POLICIES
 
     try:
         groups, saw_supported_field = parse_robots_groups(text)
     except Exception:
         LOGGER.exception("Unexpected robots parser failure")
-        return "unparseable", unknown_policies
+        return "unparseable", UNKNOWN_ROBOTS_POLICIES
 
     if not saw_supported_field:
-        return "unparseable", unknown_policies
+        return "unparseable", UNKNOWN_ROBOTS_POLICIES
 
     return "parsed", {
         token: classify_bot_policy(groups, token) for token in TRACKED_BOT_TOKENS
     }
-
-
-def endpoint_evidence(
-    result: FetchResult,
-    classification: str,
-    completed: bool,
-) -> EndpointEvidence:
-    return EndpointEvidence(
-        attempted=True,
-        completed=completed,
-        requested_scheme=result.requested_scheme,
-        final_scheme=result.final_scheme,
-        http_status=result.status,
-        content_type=result.content_type,
-        bytes_read=result.bytes_read,
-        body_truncated=result.body_truncated,
-        redirect_count=result.redirect_count,
-        retry_count=result.retry_count,
-        error_type=result.error_type,
-        classification=classification,
-        fetched_at=utc_now_iso(),
-    )
-
-
-def missing_endpoint_evidence() -> dict[str, Any]:
-    return EndpointEvidence(
-        attempted=False,
-        completed=False,
-        requested_scheme=None,
-        final_scheme=None,
-        http_status=None,
-        content_type=None,
-        bytes_read=0,
-        body_truncated=False,
-        redirect_count=0,
-        retry_count=0,
-        error_type=None,
-        classification="network_error",
-        fetched_at=None,
-    ).to_json()
-
-
-def endpoint_is_complete(endpoint: Mapping[str, Any] | None) -> bool:
-    return bool(endpoint and endpoint.get("completed") is True)
 
 
 def llms_completed(classification: str) -> bool:
@@ -1001,12 +737,9 @@ def summarize_blocking(
     return "some"
 
 
-def scan_status_from_endpoints(
-    llms_endpoint: Mapping[str, Any],
-    robots_endpoint: Mapping[str, Any],
-) -> str:
-    known_count = int(endpoint_is_complete(llms_endpoint)) + int(
-        endpoint_is_complete(robots_endpoint)
+def scan_status_from_statuses(llms_status: str, robots_status: str) -> str:
+    known_count = int(llms_completed(llms_status)) + int(
+        robots_completed(robots_status)
     )
     if known_count == 2:
         return "complete"
@@ -1015,16 +748,15 @@ def scan_status_from_endpoints(
     return "failed"
 
 
-def project_output_row(record: Mapping[str, Any]) -> dict[str, Any]:
-    endpoints = record["endpoints"]
-    llms_status = str(endpoints["llms_txt"]["classification"])
-    robots_status = str(endpoints["robots_txt"]["classification"])
-    policies = record.get("robots_policies") or {
-        token: "unknown" for token in TRACKED_BOT_TOKENS
-    }
-
+def build_output_row(
+    domain: str,
+    llms_status: str,
+    robots_status: str,
+    robots_policies: Mapping[str, str] | None,
+) -> dict[str, Any]:
+    policies = robots_policies or {token: "unknown" for token in TRACKED_BOT_TOKENS}
     row: dict[str, Any] = {
-        "domain": record["domain"],
+        "domain": domain,
         "has_llms_txt": has_llms_value(llms_status),
         "llms_txt_status": llms_status,
         "robots_txt_status": robots_status,
@@ -1039,37 +771,10 @@ def project_output_row(record: Mapping[str, Any]) -> dict[str, Any]:
     }
     for token, column in TRACKED_BOTS:
         row[column] = policies.get(token, "unknown")
-    row["scan_status"] = scan_status_from_endpoints(
-        endpoints["llms_txt"], endpoints["robots_txt"]
-    )
+    row["scan_status"] = scan_status_from_statuses(llms_status, robots_status)
+    if DEBUG_VALIDATE_ROWS:
+        validate_output_row(row)
     return row
-
-
-def build_record(
-    item: DomainInput,
-    endpoints: Mapping[str, Mapping[str, Any]],
-    robots_policies: Mapping[str, str] | None,
-) -> dict[str, Any]:
-    record = {
-        "schema_version": SCHEMA_VERSION,
-        "collector_version": VERSION,
-        "popularity_bucket": item.popularity_bucket,
-        "domain": item.domain,
-        "endpoints": {
-            "llms_txt": dict(endpoints.get("llms_txt") or missing_endpoint_evidence()),
-            "robots_txt": dict(
-                endpoints.get("robots_txt") or missing_endpoint_evidence()
-            ),
-        },
-        "robots_policies": dict(
-            robots_policies
-            if robots_policies is not None
-            else {token: "unknown" for token in TRACKED_BOT_TOKENS}
-        ),
-        "recorded_at": utc_now_iso(),
-    }
-    validate_checkpoint_record(record)
-    return record
 
 
 async def process_domain(
@@ -1080,10 +785,8 @@ async def process_domain(
     stats: RequestStats,
     settings: CollectionSettings,
 ) -> dict[str, Any]:
-    endpoints: dict[str, Mapping[str, Any]] = {
-        "llms_txt": missing_endpoint_evidence(),
-        "robots_txt": missing_endpoint_evidence(),
-    }
+    llms_status = "network_error"
+    robots_status = "network_error"
     robots_policies: dict[str, str] | None = None
 
     tasks: dict[EndpointName, asyncio.Task[FetchResult]] = {
@@ -1118,84 +821,14 @@ async def process_domain(
             result = await task
         except Exception:
             LOGGER.exception("Unexpected failure fetching %s for %s", name, item.domain)
-            result = FetchResult(
-                None, None, b"", "internal_error", "https", None, 0, False, 0, 0
-            )
+            result = FetchResult(None, None, b"", "internal_error")
 
         if name == "llms_txt":
-            classification = classify_llms_txt(result)
-            endpoints[name] = endpoint_evidence(
-                result, classification, llms_completed(classification)
-            ).to_json()
+            llms_status = classify_llms_txt(result)
         else:
-            classification, robots_policies = classify_robots_txt(result)
-            endpoints[name] = endpoint_evidence(
-                result, classification, robots_completed(classification)
-            ).to_json()
+            robots_status, robots_policies = classify_robots_txt(result)
 
-    return build_record(item, endpoints, robots_policies)
-
-
-def validate_endpoint(endpoint: Mapping[str, Any], allowed_statuses: set[str]) -> None:
-    required = {
-        "attempted",
-        "completed",
-        "requested_scheme",
-        "final_scheme",
-        "http_status",
-        "content_type",
-        "bytes_read",
-        "body_truncated",
-        "redirect_count",
-        "retry_count",
-        "error_type",
-        "classification",
-        "fetched_at",
-    }
-    if set(endpoint) != required:
-        raise ValueError("Checkpoint endpoint evidence does not match the schema.")
-    if endpoint["classification"] not in allowed_statuses:
-        raise ValueError("Checkpoint endpoint has an invalid classification.")
-    for key in ("attempted", "completed", "body_truncated"):
-        if not isinstance(endpoint[key], bool):
-            raise TypeError(f"Checkpoint endpoint `{key}` must be boolean.")
-    for key in ("bytes_read", "redirect_count", "retry_count"):
-        if not isinstance(endpoint[key], int):
-            raise TypeError(f"Checkpoint endpoint `{key}` must be an int.")
-        if endpoint[key] < 0:
-            raise ValueError(f"Checkpoint endpoint `{key}` must be non-negative.")
-
-
-def validate_checkpoint_record(record: Mapping[str, Any]) -> None:
-    required = {
-        "schema_version",
-        "collector_version",
-        "popularity_bucket",
-        "domain",
-        "endpoints",
-        "robots_policies",
-        "recorded_at",
-    }
-    if set(record) != required:
-        raise ValueError("Checkpoint record does not match the schema.")
-    if record["schema_version"] != SCHEMA_VERSION:
-        raise ValueError("Checkpoint record has an incompatible schema version.")
-    if not isinstance(record.get("domain"), str) or not record["domain"]:
-        raise ValueError("Checkpoint record has an invalid domain.")
-    if record["popularity_bucket"] != DEFAULT_POPULARITY_BUCKET:
-        raise ValueError("Checkpoint record has an unsupported popularity bucket.")
-    endpoints = record["endpoints"]
-    if not isinstance(endpoints, Mapping):
-        raise TypeError("Checkpoint record endpoints must be an object.")
-    validate_endpoint(endpoints.get("llms_txt", {}), LLMS_STATUSES)
-    validate_endpoint(endpoints.get("robots_txt", {}), ROBOTS_STATUSES)
-
-    policies = record["robots_policies"]
-    if not isinstance(policies, Mapping) or set(policies) != set(TRACKED_BOT_TOKENS):
-        raise ValueError("Checkpoint record has an invalid robots policy map.")
-    invalid = set(policies.values()) - POLICY_VALUES
-    if invalid:
-        raise ValueError(f"Checkpoint record has invalid policy values: {invalid}")
+    return build_output_row(item.domain, llms_status, robots_status, robots_policies)
 
 
 def validate_output_row(row: Mapping[str, Any]) -> None:
@@ -1227,7 +860,7 @@ def validate_output_row(row: Mapping[str, Any]) -> None:
 
 
 def validate_output_contract(
-    domains: Sequence[DomainInput], latest_records: Mapping[str, Mapping[str, Any]]
+    domains: Sequence[DomainInput], latest_rows: Mapping[str, Mapping[str, Any]]
 ) -> None:
     if len(set(OUTPUT_COLUMNS)) != len(OUTPUT_COLUMNS):
         raise ValueError("Output schema contains duplicate column names.")
@@ -1255,80 +888,12 @@ def validate_output_contract(
     domain_values = [item.domain for item in domains]
     if len(set(domain_values)) != len(domain_values):
         raise ValueError("Input domains contain duplicates after normalization.")
-    projected_row_count = sum(1 for item in domains if item.domain in latest_records)
+    projected_row_count = sum(1 for item in domains if item.domain in latest_rows)
     if projected_row_count > len(domains):
         raise ValueError("Output row count would exceed input domain count.")
-
-
-def write_checkpoint_row(handle: TextIO, record: Mapping[str, Any]) -> None:
-    validate_checkpoint_record(record)
-    handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
-    handle.flush()
-
-
-def taxonomy_metadata() -> list[dict[str, str]]:
-    purpose_by_token = (
-        {token: "training" for token, _column in TRAINING_BOTS}
-        | {token: "search_or_retrieval_indexing" for token, _column in SEARCH_BOTS}
-        | {token: "user_triggered_fetching" for token, _column in USER_FETCH_BOTS}
-    )
-    return [
-        {"token": token, "column": column, "purpose": purpose_by_token[token]}
-        for token, column in TRACKED_BOTS
-    ]
-
-
-def checkpoint_metadata(
-    input_path: Path,
-    input_digest: str,
-    input_row_count: int,
-    settings: CollectionSettings,
-) -> dict[str, Any]:
-    taxonomy = taxonomy_metadata()
-    settings_metadata = settings.as_metadata()
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "collector_version": VERSION,
-        "input_filename": input_path.name,
-        "input_sha256": input_digest,
-        "input_row_count": input_row_count,
-        "source_population": "cloudflare_radar_top_50000_unordered_bucket",
-        "popularity_bucket": DEFAULT_POPULARITY_BUCKET,
-        "tracked_agent_taxonomy": taxonomy,
-        "tracked_agent_taxonomy_digest": stable_digest(taxonomy),
-        "collection_settings": settings_metadata,
-        "collection_settings_digest": stable_digest(settings_metadata),
-        "output_columns": OUTPUT_COLUMNS,
-        "started_at": utc_now_iso(),
-        "completed_at": None,
-        "final_status_counts": None,
-    }
-
-
-def write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-        encoding="utf-8",
-    )
-    os.replace(temporary, path)
-
-
-def prepare_checkpoint(input_path: Path, settings: CollectionSettings) -> None:
-    input_digest = file_sha256(input_path)
-    input_row_count = count_csv_data_rows(input_path)
-
-    for path in (CHECKPOINT_PATH, CHECKPOINT_META_PATH, OUTPUT_PATH):
-        if path.exists():
-            path.unlink()
-
-    CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CHECKPOINT_PATH.touch()
-    write_json_atomic(
-        CHECKPOINT_META_PATH,
-        checkpoint_metadata(input_path, input_digest, input_row_count, settings),
-    )
+    if DEBUG_VALIDATE_ROWS:
+        for row in latest_rows.values():
+            validate_output_row(row)
 
 
 def csv_value(value: Any) -> Any:
@@ -1342,9 +907,9 @@ def csv_value(value: Any) -> Any:
 
 
 def write_output_csv(
-    domains: Sequence[DomainInput], latest_records: Mapping[str, Mapping[str, Any]]
+    domains: Sequence[DomainInput], latest_rows: Mapping[str, Mapping[str, Any]]
 ) -> int:
-    validate_output_contract(domains, latest_records)
+    validate_output_contract(domains, latest_rows)
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     temporary = OUTPUT_PATH.with_name(f".{OUTPUT_PATH.name}.tmp")
     count = 0
@@ -1353,11 +918,9 @@ def write_output_csv(
         writer = csv.DictWriter(handle, fieldnames=OUTPUT_COLUMNS)
         writer.writeheader()
         for item in domains:
-            record = latest_records.get(item.domain)
-            if record is None:
+            row = latest_rows.get(item.domain)
+            if row is None:
                 continue
-            row = project_output_row(record)
-            validate_output_row(row)
             writer.writerow(
                 {column: csv_value(row[column]) for column in OUTPUT_COLUMNS}
             )
@@ -1367,37 +930,12 @@ def write_output_csv(
     return count
 
 
-def compact_checkpoint(
-    domains: Sequence[DomainInput], latest_records: Mapping[str, Mapping[str, Any]]
-) -> int:
-    temporary = CHECKPOINT_PATH.with_name(f".{CHECKPOINT_PATH.name}.tmp")
-    count = 0
-    with temporary.open("w", encoding="utf-8") as handle:
-        for item in domains:
-            record = latest_records.get(item.domain)
-            if record is None:
-                continue
-            write_checkpoint_row(handle, record)
-            count += 1
-    os.replace(temporary, CHECKPOINT_PATH)
-    return count
-
-
-def update_completion_metadata(final_counts: Mapping[str, int]) -> None:
-    metadata = json.loads(CHECKPOINT_META_PATH.read_text(encoding="utf-8"))
-    metadata["completed_at"] = utc_now_iso()
-    metadata["final_status_counts"] = dict(final_counts)
-    write_json_atomic(CHECKPOINT_META_PATH, metadata)
-
-
 async def collect(
-    input_path: Path,
     domains: Sequence[DomainInput],
     settings: CollectionSettings,
 ) -> int:
     started = time.perf_counter()
-    prepare_checkpoint(input_path, settings)
-    latest_records: dict[str, dict[str, Any]] = {}
+    latest_rows: dict[str, dict[str, Any]] = {}
     pending = list(domains)
 
     LOGGER.info(
@@ -1408,7 +946,6 @@ async def collect(
     stats = RequestStats()
     processed_this_run = 0
     status_counts: Counter[str] = Counter()
-    endpoint_counts: Counter[str] = Counter()
     last_progress = time.monotonic()
     last_progress_processed = 0
 
@@ -1428,6 +965,7 @@ async def collect(
 
         async with httpx.AsyncClient(
             follow_redirects=False,
+            http2=True,
             timeout=timeout,
             limits=limits,
             verify=True,
@@ -1457,7 +995,7 @@ async def collect(
                         if item is None:
                             return
                         try:
-                            record = await process_domain(
+                            row = await process_domain(
                                 item,
                                 client,
                                 semaphore,
@@ -1465,18 +1003,16 @@ async def collect(
                                 stats,
                                 settings,
                             )
-                            await result_queue.put(record)
+                            await result_queue.put(row)
                         except Exception:
                             LOGGER.exception(
                                 "Unexpected failure scanning %s", item.domain
                             )
                             await result_queue.put(
-                                build_record(
-                                    item,
-                                    {
-                                        "llms_txt": missing_endpoint_evidence(),
-                                        "robots_txt": missing_endpoint_evidence(),
-                                    },
+                                build_output_row(
+                                    item.domain,
+                                    "network_error",
+                                    "network_error",
                                     None,
                                 )
                             )
@@ -1486,67 +1022,43 @@ async def collect(
             producer_task = asyncio.create_task(producer())
             workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
 
-            with CHECKPOINT_PATH.open("a", encoding="utf-8") as checkpoint:
-                for _ in range(len(pending)):
-                    record = await result_queue.get()
-                    try:
-                        write_checkpoint_row(checkpoint, record)
-                        latest_records[str(record["domain"])] = record
-                        processed_this_run += 1
-                        row = project_output_row(record)
-                        status_counts[str(row["scan_status"])] += 1
-                        endpoint_counts[f"llms:{row['llms_txt_status']}"] += 1
-                        endpoint_counts[f"robots:{row['robots_txt_status']}"] += 1
-                    finally:
-                        result_queue.task_done()
+            for _ in range(len(pending)):
+                row = await result_queue.get()
+                try:
+                    latest_rows[str(row["domain"])] = row
+                    processed_this_run += 1
+                    status_counts[str(row["scan_status"])] += 1
+                finally:
+                    result_queue.task_done()
 
-                    now = time.monotonic()
-                    if (
-                        processed_this_run % LOG_EVERY == 0
-                        or now - last_progress >= PROGRESS_SECONDS
-                        or processed_this_run == len(pending)
-                    ):
-                        rate = processed_this_run / max(
-                            time.perf_counter() - started, 0.1
-                        )
-                        interval_elapsed = max(now - last_progress, 0.1)
-                        interval_processed = (
-                            processed_this_run - last_progress_processed
-                        )
-                        interval_rate = interval_processed / interval_elapsed
-                        LOGGER.info(
-                            "Processed %s / %s pending | complete=%s partial=%s "
-                            "failed=%s | retries=%s fallbacks=%s | "
-                            "%.2f recent domains/s | %.2f avg domains/s",
-                            processed_this_run,
-                            len(pending),
-                            status_counts["complete"],
-                            status_counts["partial"],
-                            status_counts["failed"],
-                            stats.retries,
-                            stats.http_fallbacks,
-                            interval_rate,
-                            rate,
-                        )
-                        last_progress = now
-                        last_progress_processed = processed_this_run
+                now = time.monotonic()
+                if now - last_progress >= PROGRESS_SECONDS:
+                    rate = processed_this_run / max(
+                        time.perf_counter() - started, 0.1
+                    )
+                    interval_elapsed = max(now - last_progress, 0.1)
+                    interval_processed = processed_this_run - last_progress_processed
+                    interval_rate = interval_processed / interval_elapsed
+                    LOGGER.info(
+                        "Processed %s / %s pending | %.2f recent domains/s | "
+                        "%.2f avg domains/s",
+                        processed_this_run,
+                        len(pending),
+                        interval_rate,
+                        rate,
+                    )
+                    last_progress = now
+                    last_progress_processed = processed_this_run
 
             await input_queue.join()
             await result_queue.join()
             await producer_task
             await asyncio.gather(*workers)
 
-    row_count = write_output_csv(domains, latest_records)
-    final_counts = Counter(
-        str(project_output_row(latest_records[item.domain])["scan_status"])
-        for item in domains
-        if item.domain in latest_records
-    )
-    compacted = compact_checkpoint(domains, latest_records)
-    update_completion_metadata(final_counts)
+    row_count = write_output_csv(domains, latest_rows)
+    final_counts = status_counts
 
     LOGGER.info("Wrote %s rows to %s", row_count, OUTPUT_PATH)
-    LOGGER.info("Compacted %s checkpoint records at %s", compacted, CHECKPOINT_PATH)
     LOGGER.info(
         "Final scan status: complete=%s partial=%s failed=%s",
         final_counts["complete"],
@@ -1554,9 +1066,8 @@ async def collect(
         final_counts["failed"],
     )
     LOGGER.info(
-        "HTTP attempts=%s retries=%s redirects=%s fallbacks=%s elapsed=%.1fs",
+        "HTTP attempts=%s redirects=%s fallbacks=%s elapsed=%.1fs",
         stats.attempts,
-        stats.retries,
         stats.redirects,
         stats.http_fallbacks,
         time.perf_counter() - started,
@@ -1564,63 +1075,16 @@ async def collect(
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Scan Cloudflare Radar bucket domains for llms.txt and declared "
-            "AI crawler policy signals. Writes data/processed/domains.csv and "
-            "starts a fresh collection each time."
-        )
-    )
-    parser.add_argument(
-        "input", type=Path, help="Input CSV containing a domain column."
-    )
-    parser.add_argument(
-        "--limit",
-        type=int,
-        help="Scan only the first N valid domains. Useful for testing.",
-    )
-    parser.add_argument(
-        "--workers",
-        type=int,
-        default=DOMAIN_WORKERS,
-        help=f"Concurrent domain workers. Default: {DOMAIN_WORKERS}.",
-    )
-    parser.add_argument(
-        "--request-concurrency",
-        type=int,
-        default=REQUEST_CONCURRENCY,
-        help=f"Maximum concurrent HTTP requests. Default: {REQUEST_CONCURRENCY}.",
-    )
-    parser.add_argument(
-        "--connect-timeout",
-        type=float,
-        default=CONNECT_TIMEOUT,
-        help=f"HTTP connect timeout in seconds. Default: {CONNECT_TIMEOUT}.",
-    )
-    parser.add_argument(
-        "--read-timeout",
-        type=float,
-        default=READ_TIMEOUT,
-        help=f"HTTP read timeout in seconds. Default: {READ_TIMEOUT}.",
-    )
-    return parser
+def main(argv: Sequence[str] | None = None) -> int:
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if len(arguments) != 1:
+        print(f"Usage: {Path(sys.argv[0]).name} INPUT", file=sys.stderr)
+        return 2
 
-
-def main() -> int:
-    parser = build_parser()
-    args = parser.parse_args()
-
-    if not args.input.is_file():
-        parser.error(f"input file does not exist: {args.input}")
-    if args.limit is not None and args.limit < 1:
-        parser.error("--limit must be at least 1")
-    if args.workers < 1:
-        parser.error("--workers must be at least 1")
-    if args.request_concurrency < 1:
-        parser.error("--request-concurrency must be at least 1")
-    if args.connect_timeout <= 0 or args.read_timeout <= 0:
-        parser.error("--connect-timeout and --read-timeout must be positive")
+    input_path = Path(arguments[0])
+    if not input_path.is_file():
+        print(f"input file does not exist: {input_path}", file=sys.stderr)
+        return 2
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
@@ -1628,9 +1092,9 @@ def main() -> int:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     try:
-        domains, skipped = load_domains(args.input, args.limit)
+        domains, skipped = load_domains(input_path)
         if not domains:
-            raise ValueError(f"No valid domains found in {args.input}")
+            raise ValueError(f"No valid domains found in {input_path}")
         if skipped:
             LOGGER.info(
                 "Skipped %s input rows: %s",
@@ -1638,13 +1102,7 @@ def main() -> int:
                 ", ".join(f"{reason}={count}" for reason, count in skipped.items()),
             )
 
-        settings = CollectionSettings(
-            workers=args.workers,
-            request_concurrency=args.request_concurrency,
-            connect_timeout=args.connect_timeout,
-            read_timeout=args.read_timeout,
-        )
-        return asyncio.run(collect(args.input.resolve(), domains, settings))
+        return asyncio.run(collect(domains, CollectionSettings()))
     except KeyboardInterrupt:
         LOGGER.warning("Interrupted. Re-run the command to start a fresh collection.")
         return 130
