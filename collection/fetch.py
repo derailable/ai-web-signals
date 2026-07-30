@@ -17,7 +17,7 @@ import socket
 import ssl
 import time
 from collections import Counter
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -28,7 +28,7 @@ import httpx
 
 LOGGER = logging.getLogger(__name__)
 
-VERSION = "3.2.0"
+VERSION = "3.3.0"
 SCHEMA_VERSION = 6
 REPOSITORY_URL = "https://github.com/derailable/ai-web-signals"
 
@@ -40,16 +40,20 @@ CHECKPOINT_META_PATH = REPO_ROOT / "data/raw/domains_checkpoint.meta.json"
 
 USER_AGENT = f"AIWebSignals/{VERSION} (+{REPOSITORY_URL})"
 DEFAULT_POPULARITY_BUCKET = 50000
-DOMAIN_WORKERS = 30
-REQUEST_CONCURRENCY = 40
+DOMAIN_WORKERS = 50
+REQUEST_CONCURRENCY = 80
 LOG_EVERY = 500
 PROGRESS_SECONDS = 30.0
-REDIRECT_LIMIT = 8
+REDIRECT_LIMIT = 4
 LLMS_SAMPLE_LIMIT = 256 * 1024
 ROBOTS_SAMPLE_LIMIT = 512 * 1024
+CONNECT_TIMEOUT = 3.0
+READ_TIMEOUT = 5.0
+WRITE_TIMEOUT = 3.0
+POOL_TIMEOUT = 3.0
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
-RETRY_DELAYS = (1.0,)
-MAX_RETRY_AFTER_SECONDS = 10.0
+RETRY_DELAYS: tuple[float, ...] = ()
+MAX_RETRY_AFTER_SECONDS = 3.0
 
 EndpointName = Literal["llms_txt", "robots_txt"]
 
@@ -143,13 +147,15 @@ class DomainInput:
 class CollectionSettings:
     workers: int = DOMAIN_WORKERS
     request_concurrency: int = REQUEST_CONCURRENCY
-    connect_timeout: float = 5.0
-    read_timeout: float = 10.0
-    write_timeout: float = 5.0
-    pool_timeout: float = 5.0
+    connect_timeout: float = CONNECT_TIMEOUT
+    read_timeout: float = READ_TIMEOUT
+    write_timeout: float = WRITE_TIMEOUT
+    pool_timeout: float = POOL_TIMEOUT
     llms_sample_limit: int = LLMS_SAMPLE_LIMIT
     robots_sample_limit: int = ROBOTS_SAMPLE_LIMIT
     redirect_limit: int = REDIRECT_LIMIT
+    retry_delays: tuple[float, ...] = RETRY_DELAYS
+    max_retry_after_seconds: float = MAX_RETRY_AFTER_SECONDS
 
     def as_metadata(self) -> dict[str, Any]:
         return {
@@ -163,8 +169,8 @@ class CollectionSettings:
             "robots_sample_limit": self.robots_sample_limit,
             "redirect_limit": self.redirect_limit,
             "retryable_status_codes": sorted(RETRYABLE_STATUS_CODES),
-            "retry_delays": list(RETRY_DELAYS),
-            "max_retry_after_seconds": MAX_RETRY_AFTER_SECONDS,
+            "retry_delays": list(self.retry_delays),
+            "max_retry_after_seconds": self.max_retry_after_seconds,
         }
 
 
@@ -459,12 +465,12 @@ def should_retry_exception(error: Exception) -> bool:
     )
 
 
-def parse_retry_after(value: str | None) -> float | None:
+def parse_retry_after(value: str | None, max_seconds: float) -> float | None:
     if not value:
         return None
     text = value.strip()
     if text.isdigit():
-        return min(float(text), MAX_RETRY_AFTER_SECONDS)
+        return min(float(text), max_seconds)
     try:
         parsed = email.utils.parsedate_to_datetime(text)
     except (TypeError, ValueError):
@@ -472,7 +478,7 @@ def parse_retry_after(value: str | None) -> float | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     seconds = (parsed - datetime.now(UTC)).total_seconds()
-    return min(max(seconds, 0.0), MAX_RETRY_AFTER_SECONDS)
+    return min(max(seconds, 0.0), max_seconds)
 
 
 async def read_limited(response: httpx.Response, limit: int) -> tuple[bytes, bool]:
@@ -515,7 +521,7 @@ async def fetch_once(
     total_redirects = 0
     total_retries = 0
 
-    for attempt in range(len(RETRY_DELAYS) + 1):
+    for attempt in range(len(settings.retry_delays) + 1):
         current_url = url
         redirects_this_attempt = 0
         retry_delay: float | None = None
@@ -580,16 +586,19 @@ async def fetch_once(
                     continue
 
                 if response.status_code in RETRYABLE_STATUS_CODES and attempt < len(
-                    RETRY_DELAYS
+                    settings.retry_delays
                 ):
-                    retry_after = parse_retry_after(response.headers.get("retry-after"))
+                    retry_after = parse_retry_after(
+                        response.headers.get("retry-after"),
+                        settings.max_retry_after_seconds,
+                    )
                     await response.aclose()
                     total_retries += 1
                     stats.retries += 1
                     retry_delay = (
                         retry_after
                         if retry_after is not None
-                        else RETRY_DELAYS[attempt] + random.uniform(0.0, 0.25)
+                        else settings.retry_delays[attempt] + random.uniform(0.0, 0.25)
                     )
                 else:
                     body, truncated = await read_limited(response, body_limit)
@@ -608,10 +617,12 @@ async def fetch_once(
                 break
 
         except httpx.HTTPError as error:
-            if attempt < len(RETRY_DELAYS) and should_retry_exception(error):
+            if attempt < len(settings.retry_delays) and should_retry_exception(error):
                 total_retries += 1
                 stats.retries += 1
-                await asyncio.sleep(RETRY_DELAYS[attempt] + random.uniform(0.0, 0.25))
+                await asyncio.sleep(
+                    settings.retry_delays[attempt] + random.uniform(0.0, 0.25)
+                )
                 continue
             return FetchResult(
                 None,
@@ -1064,28 +1075,20 @@ def build_record(
 
 async def process_domain(
     item: DomainInput,
-    existing: Mapping[str, Any] | None,
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
     safety_cache: HostSafetyCache,
     stats: RequestStats,
     settings: CollectionSettings,
-) -> dict[str, Any] | None:
-    existing_endpoints = dict(existing.get("endpoints", {})) if existing else {}
+) -> dict[str, Any]:
     endpoints: dict[str, Mapping[str, Any]] = {
-        "llms_txt": existing_endpoints.get("llms_txt") or missing_endpoint_evidence(),
-        "robots_txt": existing_endpoints.get("robots_txt")
-        or missing_endpoint_evidence(),
+        "llms_txt": missing_endpoint_evidence(),
+        "robots_txt": missing_endpoint_evidence(),
     }
-    robots_policies = (
-        dict(existing.get("robots_policies", {}))
-        if existing and existing.get("robots_policies")
-        else None
-    )
+    robots_policies: dict[str, str] | None = None
 
-    tasks: dict[EndpointName, asyncio.Task[FetchResult]] = {}
-    if not endpoint_is_complete(endpoints["llms_txt"]):
-        tasks["llms_txt"] = asyncio.create_task(
+    tasks: dict[EndpointName, asyncio.Task[FetchResult]] = {
+        "llms_txt": asyncio.create_task(
             fetch_endpoint(
                 client,
                 semaphore,
@@ -1096,9 +1099,8 @@ async def process_domain(
                 settings.llms_sample_limit,
                 settings,
             )
-        )
-    if not endpoint_is_complete(endpoints["robots_txt"]):
-        tasks["robots_txt"] = asyncio.create_task(
+        ),
+        "robots_txt": asyncio.create_task(
             fetch_endpoint(
                 client,
                 semaphore,
@@ -1110,9 +1112,7 @@ async def process_domain(
                 settings,
             )
         )
-
-    if not tasks:
-        return None
+    }
 
     for name, task in tasks.items():
         try:
@@ -1261,44 +1261,6 @@ def validate_output_contract(
         raise ValueError("Output row count would exceed input domain count.")
 
 
-def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
-    if not path.exists():
-        return
-
-    with path.open("r", encoding="utf-8") as handle:
-        pending_malformed: tuple[int, str] | None = None
-        for line_number, line in enumerate(handle, start=1):
-            if not line.strip():
-                continue
-            if pending_malformed is not None:
-                raise ValueError(
-                    "Malformed checkpoint line "
-                    f"{pending_malformed[0]} is not the final line."
-                )
-            try:
-                value = json.loads(line)
-            except json.JSONDecodeError:
-                pending_malformed = (line_number, line)
-                continue
-            if not isinstance(value, dict):
-                raise TypeError(f"Checkpoint line {line_number} is not a JSON object.")
-            validate_checkpoint_record(value)
-            yield value
-
-        if pending_malformed is not None:
-            LOGGER.warning(
-                "Ignoring an incomplete final checkpoint line at line %s.",
-                pending_malformed[0],
-            )
-
-
-def load_checkpoint(path: Path) -> dict[str, dict[str, Any]]:
-    latest: dict[str, dict[str, Any]] = {}
-    for record in iter_jsonl(path):
-        latest[str(record["domain"])] = record
-    return latest
-
-
 def write_checkpoint_row(handle: TextIO, record: Mapping[str, Any]) -> None:
     validate_checkpoint_record(record)
     handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
@@ -1354,54 +1316,20 @@ def write_json_atomic(path: Path, value: Mapping[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def prepare_checkpoint(
-    input_path: Path,
-    domains: Sequence[DomainInput],
-    fresh: bool,
-    settings: CollectionSettings,
-) -> dict[str, dict[str, Any]]:
+def prepare_checkpoint(input_path: Path, settings: CollectionSettings) -> None:
     input_digest = file_sha256(input_path)
     input_row_count = count_csv_data_rows(input_path)
 
-    if fresh:
-        for path in (CHECKPOINT_PATH, CHECKPOINT_META_PATH, OUTPUT_PATH):
-            if path.exists():
-                path.unlink()
+    for path in (CHECKPOINT_PATH, CHECKPOINT_META_PATH, OUTPUT_PATH):
+        if path.exists():
+            path.unlink()
 
-    if CHECKPOINT_PATH.exists() != CHECKPOINT_META_PATH.exists():
-        raise ValueError(
-            "Checkpoint files are incomplete. Re-run with --fresh to start over."
-        )
-
-    expected_taxonomy_digest = stable_digest(taxonomy_metadata())
-    expected_settings_digest = stable_digest(settings.as_metadata())
-
-    if not CHECKPOINT_PATH.exists():
-        CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        CHECKPOINT_PATH.touch()
-        write_json_atomic(
-            CHECKPOINT_META_PATH,
-            checkpoint_metadata(input_path, input_digest, input_row_count, settings),
-        )
-        return {}
-
-    metadata = json.loads(CHECKPOINT_META_PATH.read_text(encoding="utf-8"))
-    checks = {
-        "schema version": metadata.get("schema_version") == SCHEMA_VERSION,
-        "input digest": metadata.get("input_sha256") == input_digest,
-        "taxonomy": metadata.get("tracked_agent_taxonomy_digest")
-        == expected_taxonomy_digest,
-        "collector settings": metadata.get("collection_settings_digest")
-        == expected_settings_digest,
-        "output columns": metadata.get("output_columns") == OUTPUT_COLUMNS,
-    }
-    if not all(checks.values()):
-        failed = ", ".join(name for name, passed in checks.items() if not passed)
-        raise ValueError(
-            "The checkpoint is incompatible with this run "
-            f"({failed}). Re-run with --fresh to start over."
-        )
-    return load_checkpoint(CHECKPOINT_PATH)
+    CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    CHECKPOINT_PATH.touch()
+    write_json_atomic(
+        CHECKPOINT_META_PATH,
+        checkpoint_metadata(input_path, input_digest, input_row_count, settings),
+    )
 
 
 def csv_value(value: Any) -> Any:
@@ -1463,43 +1391,19 @@ def update_completion_metadata(final_counts: Mapping[str, int]) -> None:
     write_json_atomic(CHECKPOINT_META_PATH, metadata)
 
 
-def mark_collection_started() -> None:
-    metadata = json.loads(CHECKPOINT_META_PATH.read_text(encoding="utf-8"))
-    metadata["started_at"] = utc_now_iso()
-    metadata["completed_at"] = None
-    metadata["final_status_counts"] = None
-    write_json_atomic(CHECKPOINT_META_PATH, metadata)
-
-
-def record_fully_complete(record: Mapping[str, Any] | None) -> bool:
-    if not record:
-        return False
-    endpoints = record.get("endpoints", {})
-    return endpoint_is_complete(endpoints.get("llms_txt")) and endpoint_is_complete(
-        endpoints.get("robots_txt")
-    )
-
-
 async def collect(
     input_path: Path,
     domains: Sequence[DomainInput],
-    fresh: bool,
     settings: CollectionSettings,
 ) -> int:
     started = time.perf_counter()
-    latest_records = prepare_checkpoint(input_path, domains, fresh, settings)
-    mark_collection_started()
-    pending = [
-        item
-        for item in domains
-        if not record_fully_complete(latest_records.get(item.domain))
-    ]
+    prepare_checkpoint(input_path, settings)
+    latest_records: dict[str, dict[str, Any]] = {}
+    pending = list(domains)
 
     LOGGER.info(
-        "Loaded %s domains. %s fully complete, %s pending or partial.",
+        "Loaded %s domains for a fresh one-shot collection.",
         len(domains),
-        len(domains) - len(pending),
-        len(pending),
     )
 
     stats = RequestStats()
@@ -1555,15 +1459,13 @@ async def collect(
                         try:
                             record = await process_domain(
                                 item,
-                                latest_records.get(item.domain),
                                 client,
                                 semaphore,
                                 safety_cache,
                                 stats,
                                 settings,
                             )
-                            if record is not None:
-                                await result_queue.put(record)
+                            await result_queue.put(record)
                         except Exception:
                             LOGGER.exception(
                                 "Unexpected failure scanning %s", item.domain
@@ -1658,7 +1560,7 @@ def build_parser() -> argparse.ArgumentParser:
         description=(
             "Scan Cloudflare Radar bucket domains for llms.txt and declared "
             "AI crawler policy signals. Writes data/processed/domains.csv and "
-            "resumes automatically."
+            "starts a fresh collection each time."
         )
     )
     parser.add_argument(
@@ -1668,11 +1570,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit",
         type=int,
         help="Scan only the first N valid domains. Useful for testing.",
-    )
-    parser.add_argument(
-        "--fresh",
-        action="store_true",
-        help="Discard the existing checkpoint and start over.",
     )
     parser.add_argument(
         "--workers",
@@ -1689,14 +1586,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--connect-timeout",
         type=float,
-        default=5.0,
-        help="HTTP connect timeout in seconds. Default: 5.0.",
+        default=CONNECT_TIMEOUT,
+        help=f"HTTP connect timeout in seconds. Default: {CONNECT_TIMEOUT}.",
     )
     parser.add_argument(
         "--read-timeout",
         type=float,
-        default=10.0,
-        help="HTTP read timeout in seconds. Default: 10.0.",
+        default=READ_TIMEOUT,
+        help=f"HTTP read timeout in seconds. Default: {READ_TIMEOUT}.",
     )
     return parser
 
@@ -1738,9 +1635,9 @@ def main() -> int:
             connect_timeout=args.connect_timeout,
             read_timeout=args.read_timeout,
         )
-        return asyncio.run(collect(args.input.resolve(), domains, args.fresh, settings))
+        return asyncio.run(collect(args.input.resolve(), domains, settings))
     except KeyboardInterrupt:
-        LOGGER.warning("Interrupted. Re-run the command to resume.")
+        LOGGER.warning("Interrupted. Re-run the command to start a fresh collection.")
         return 130
     except Exception:
         LOGGER.exception("Fatal error")
