@@ -1,4 +1,4 @@
-"""Collect public AI web signals for Cloudflare Radar domain buckets."""
+"""Collect public AI web signals for the Tranco Top 100,000 domains."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
@@ -30,13 +30,13 @@ REPOSITORY_URL = "https://github.com/derailable/ai-web-signals"
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "collection" else SCRIPT_DIR
 OUTPUT_PATH = REPO_ROOT / "data/processed/domains.csv"
+DEFAULT_INPUT_PATH = REPO_ROOT / "data/input/tranco-top-100000.csv"
 
 USER_AGENT = f"AIWebSignals/{VERSION} (+{REPOSITORY_URL})"
-DEFAULT_POPULARITY_BUCKET = 100000
+TRANCO_SCAN_SCOPE = 100000
 DOMAIN_WORKERS = 50
 REQUEST_CONCURRENCY = 50
 PROGRESS_SECONDS = 300.0
-DEBUG_VALIDATE_ROWS = False
 REDIRECT_LIMIT = 4
 LLMS_SAMPLE_LIMIT = 256 * 1024
 ROBOTS_SAMPLE_LIMIT = 512 * 1024
@@ -44,47 +44,11 @@ CONNECT_TIMEOUT = 3.0
 READ_TIMEOUT = 5.0
 WRITE_TIMEOUT = 3.0
 POOL_TIMEOUT = 3.0
-REQUEST_RETRIES = 0
-RETRY_BACKOFF_BASE = 0.25
-DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$")
 CHARSET_RE = re.compile(r"charset\s*=\s*[\"']?([^;\"'\s]+)", re.IGNORECASE)
 HTML_MARKUP_RE = re.compile(
     r"<(?:title|div|span|script|style|meta|form|nav|footer)\b"
 )
-
-EndpointName = Literal["llms_txt", "robots_txt"]
-
-LLMS_STATUSES = {
-    "present",
-    "absent",
-    "empty",
-    "html",
-    "non_text",
-    "http_error",
-    "network_error",
-}
-ROBOTS_STATUSES = {
-    "parsed",
-    "absent",
-    "empty",
-    "html",
-    "non_text",
-    "unparseable",
-    "http_error",
-    "network_error",
-}
-POLICY_VALUES = {
-    "allow_default",
-    "allow_explicit",
-    "allow_wildcard",
-    "partial_explicit",
-    "partial_wildcard",
-    "blocked_explicit",
-    "blocked_wildcard",
-    "unknown",
-}
-RESTRICTED_STATES = {"none", "some", "all", "unknown"}
-SCAN_STATES = {"complete", "partial", "failed"}
 
 # First-party docs checked 2026-07-29:
 # OpenAI: https://developers.openai.com/api/docs/bots
@@ -94,7 +58,7 @@ SCAN_STATES = {"complete", "partial", "failed"}
 # Perplexity: https://docs.perplexity.ai/docs/resources/perplexity-crawlers
 # Mistral: https://docs.mistral.ai/robots
 # DuckDuckGo: https://duckduckgo.com/duckduckgo-help-pages/results/duckassistbot
-# Meta official crawler doc was linked from Cloudflare Radar during review:
+# Meta official crawler documentation checked during review:
 # https://developers.facebook.com/docs/sharing/webmasters/web-crawlers
 TRAINING_BOTS = (
     "GPTBot",
@@ -130,6 +94,7 @@ ALLOW_DEFAULT_ROBOTS_POLICIES = {
 }
 
 OUTPUT_COLUMNS = [
+    "rank",
     "domain",
     "has_llms_txt",
     "llms_txt_status",
@@ -145,22 +110,8 @@ OUTPUT_COLUMNS = [
 
 @dataclass(frozen=True)
 class DomainInput:
+    rank: int
     domain: str
-
-
-@dataclass(frozen=True)
-class CollectionSettings:
-    workers: int = DOMAIN_WORKERS
-    request_concurrency: int = REQUEST_CONCURRENCY
-    connect_timeout: float = CONNECT_TIMEOUT
-    read_timeout: float = READ_TIMEOUT
-    write_timeout: float = WRITE_TIMEOUT
-    pool_timeout: float = POOL_TIMEOUT
-    llms_sample_limit: int = LLMS_SAMPLE_LIMIT
-    robots_sample_limit: int = ROBOTS_SAMPLE_LIMIT
-    redirect_limit: int = REDIRECT_LIMIT
-    request_retries: int = REQUEST_RETRIES
-    retry_backoff_base: float = RETRY_BACKOFF_BASE
 
 
 @dataclass(frozen=True)
@@ -177,8 +128,6 @@ class RequestStats:
     redirects: int = 0
     http_fallbacks: int = 0
     http_fallback_recoveries: int = 0
-    retries: int = 0
-    retry_recoveries: int = 0
     request_durations: list[float] = field(default_factory=list)
     endpoint_statuses: Counter[str] = field(default_factory=Counter)
     endpoint_error_reasons: Counter[str] = field(default_factory=Counter)
@@ -192,7 +141,7 @@ class HostSafetyCache:
     layer.
     """
 
-    def __init__(self, max_entries: int = DEFAULT_POPULARITY_BUCKET) -> None:
+    def __init__(self, max_entries: int = TRANCO_SCAN_SCOPE) -> None:
         self._results: dict[str, str | None] = {}
         self._tasks: dict[str, asyncio.Task[str | None]] = {}
         self._max_entries = max_entries
@@ -264,53 +213,55 @@ def normalize_domain(raw: str) -> tuple[str | None, str | None]:
     return None, "IP addresses are not accepted"
 
 
-def identify_column(fieldnames: Sequence[str], candidates: Sequence[str]) -> str | None:
-    by_lowercase = {name.strip().lower(): name for name in fieldnames}
-    for candidate in candidates:
-        if candidate in by_lowercase:
-            return by_lowercase[candidate]
-    return None
+def parse_rank(raw: str, row_number: int) -> int:
+    value = raw.strip()
+    if not value or not value.isdecimal():
+        raise ValueError(f"Input row {row_number} has a non-numeric rank.")
+    rank = int(value)
+    if rank < 1:
+        raise ValueError(f"Input row {row_number} has a rank below 1.")
+    return rank
 
 
-def identify_domain_column(fieldnames: Sequence[str]) -> str:
-    exact = identify_column(fieldnames, ("domain", "hostname", "host"))
-    if exact:
-        return exact
-    matches = [name for name in fieldnames if "domain" in name.strip().lower()]
-    if len(matches) == 1:
-        return matches[0]
-    raise ValueError(
-        "Could not identify the domain column. "
-        f"Available columns: {', '.join(fieldnames)}"
-    )
-
-
-def load_domains(path: Path) -> tuple[list[DomainInput], Counter[str]]:
+def load_domains(
+    path: Path, expected_count: int = TRANCO_SCAN_SCOPE
+) -> list[DomainInput]:
     domains: list[DomainInput] = []
-    skipped: Counter[str] = Counter()
-    seen: set[str] = set()
+    seen_domains: set[str] = set()
 
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None:
             raise ValueError("Input CSV has no header row.")
+        if reader.fieldnames != ["rank", "domain"]:
+            raise ValueError(
+                "Input CSV must have exactly these columns in order: rank,domain."
+            )
 
-        domain_column = identify_domain_column(reader.fieldnames)
-        for row in reader:
-            normalized, reason = normalize_domain(row.get(domain_column, "") or "")
+        for row_number, row in enumerate(reader, start=2):
+            rank = parse_rank(row.get("rank", "") or "", row_number)
+            expected_rank = len(domains) + 1
+            if rank != expected_rank:
+                raise ValueError(
+                    f"Input row {row_number} has rank {rank}; "
+                    f"expected {expected_rank}."
+                )
+
+            normalized, reason = normalize_domain(row.get("domain", "") or "")
             if reason:
-                skipped[reason] += 1
-                continue
+                raise ValueError(f"Input row {row_number} has invalid domain: {reason}.")
             assert normalized is not None
-            if normalized in seen:
-                skipped["duplicate after normalization"] += 1
-                continue
-            seen.add(normalized)
-            domains.append(DomainInput(domain=normalized))
-            if len(domains) >= DEFAULT_POPULARITY_BUCKET:
-                break
+            if normalized in seen_domains:
+                raise ValueError(f"Input contains duplicate domain {normalized}.")
+            seen_domains.add(normalized)
+            domains.append(DomainInput(rank=rank, domain=normalized))
 
-    return domains, skipped
+    if len(domains) != expected_count:
+        raise ValueError(
+            f"Input CSV must contain exactly {expected_count} data rows; "
+            f"found {len(domains)}."
+        )
+    return domains
 
 
 def is_forbidden_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
@@ -405,19 +356,6 @@ def classify_httpx_error(error: Exception) -> str:
     return "other_network_error"
 
 
-def retryable_error_type(error_type: str | None) -> bool:
-    return error_type in {
-        "connect_timeout",
-        "read_timeout",
-        "write_timeout",
-        "pool_timeout",
-        "dns_error",
-        "connection_reset",
-        "other_network_error",
-        "protocol_error",
-    }
-
-
 async def read_limited(response: httpx.Response, limit: int) -> bytes:
     chunks: list[bytes] = []
     total = 0
@@ -450,7 +388,6 @@ async def fetch_once(
     stats: RequestStats,
     url: str,
     body_limit: int,
-    settings: CollectionSettings,
 ) -> FetchResult:
     current_url = url
     redirects = 0
@@ -475,7 +412,7 @@ async def fetch_once(
                         await response.aclose()
                         redirects += 1
                         stats.redirects += 1
-                        if redirects > settings.redirect_limit:
+                        if redirects > REDIRECT_LIMIT:
                             return FetchResult(None, None, b"", "redirect_error")
                         current_url = urljoin(current_url, location)
                         if urlparse(current_url).scheme not in {"http", "https"}:
@@ -498,37 +435,6 @@ async def fetch_once(
     return FetchResult(None, None, b"", "other_network_error")
 
 
-async def fetch_with_retries(
-    client: httpx.AsyncClient,
-    semaphore: asyncio.Semaphore,
-    safety_cache: HostSafetyCache,
-    stats: RequestStats,
-    url: str,
-    body_limit: int,
-    settings: CollectionSettings,
-) -> FetchResult:
-    last_result = await fetch_once(
-        client, semaphore, safety_cache, stats, url, body_limit, settings
-    )
-    if last_result.status is not None or not retryable_error_type(last_result.error_type):
-        return last_result
-
-    for retry_index in range(settings.request_retries):
-        stats.retries += 1
-        if settings.retry_backoff_base > 0:
-            await asyncio.sleep(settings.retry_backoff_base * (2**retry_index))
-        retry_result = await fetch_once(
-            client, semaphore, safety_cache, stats, url, body_limit, settings
-        )
-        if retry_result.status is not None:
-            stats.retry_recoveries += 1
-            return retry_result
-        last_result = retry_result
-        if not retryable_error_type(last_result.error_type):
-            return last_result
-    return last_result
-
-
 def should_http_fallback(result: FetchResult) -> bool:
     return result.status is None and result.error_type in {
         "connect_timeout",
@@ -548,29 +454,26 @@ async def fetch_endpoint(
     domain: str,
     path: str,
     body_limit: int,
-    settings: CollectionSettings,
 ) -> FetchResult:
-    https_result = await fetch_with_retries(
+    https_result = await fetch_once(
         client,
         semaphore,
         safety_cache,
         stats,
         f"https://{domain}{path}",
         body_limit,
-        settings,
     )
     if not should_http_fallback(https_result):
         return https_result
 
     stats.http_fallbacks += 1
-    http_result = await fetch_with_retries(
+    http_result = await fetch_once(
         client,
         semaphore,
         safety_cache,
         stats,
         f"http://{domain}{path}",
         body_limit,
-        settings,
     )
     if http_result.status is not None:
         stats.http_fallback_recoveries += 1
@@ -858,6 +761,7 @@ def scan_status_from_statuses(llms_status: str, robots_status: str) -> str:
 
 
 def build_output_row(
+    rank: int,
     domain: str,
     llms_status: str,
     robots_status: str,
@@ -865,6 +769,7 @@ def build_output_row(
 ) -> dict[str, Any]:
     policies = robots_policies or {token: "unknown" for token in TRACKED_BOT_TOKENS}
     row: dict[str, Any] = {
+        "rank": rank,
         "domain": domain,
         "has_llms_txt": has_llms_value(llms_status),
         "llms_txt_status": llms_status,
@@ -881,8 +786,6 @@ def build_output_row(
         },
     }
     row["scan_status"] = scan_status_from_statuses(llms_status, robots_status)
-    if DEBUG_VALIDATE_ROWS:
-        validate_output_row(row)
     return row
 
 
@@ -892,114 +795,45 @@ async def process_domain(
     semaphore: asyncio.Semaphore,
     safety_cache: HostSafetyCache,
     stats: RequestStats,
-    settings: CollectionSettings,
 ) -> dict[str, Any]:
-    llms_status = "network_error"
-    robots_status = "network_error"
-    robots_policies: dict[str, str] | None = None
-
-    tasks: dict[EndpointName, asyncio.Task[FetchResult]] = {
-        "llms_txt": asyncio.create_task(
-            fetch_endpoint(
-                client,
-                semaphore,
-                safety_cache,
-                stats,
-                item.domain,
-                "/llms.txt",
-                settings.llms_sample_limit,
-                settings,
-            )
+    llms_result, robots_result = await asyncio.gather(
+        fetch_endpoint(
+            client,
+            semaphore,
+            safety_cache,
+            stats,
+            item.domain,
+            "/llms.txt",
+            LLMS_SAMPLE_LIMIT,
         ),
-        "robots_txt": asyncio.create_task(
-            fetch_endpoint(
-                client,
-                semaphore,
-                safety_cache,
-                stats,
-                item.domain,
-                "/robots.txt",
-                settings.robots_sample_limit,
-                settings,
-            )
-        )
-    }
+        fetch_endpoint(
+            client,
+            semaphore,
+            safety_cache,
+            stats,
+            item.domain,
+            "/robots.txt",
+            ROBOTS_SAMPLE_LIMIT,
+        ),
+        return_exceptions=True,
+    )
+    if isinstance(llms_result, Exception):
+        llms_result = FetchResult(None, None, b"", "internal_error")
+    if isinstance(robots_result, Exception):
+        robots_result = FetchResult(None, None, b"", "internal_error")
 
-    for name, task in tasks.items():
-        try:
-            result = await task
-        except Exception:
-            result = FetchResult(None, None, b"", "internal_error")
+    llms_status = classify_llms_txt(llms_result)
+    robots_status, robots_policies = classify_robots_txt(robots_result)
+    stats.endpoint_statuses[f"llms_txt:{llms_status}"] += 1
+    stats.endpoint_statuses[f"robots_txt:{robots_status}"] += 1
+    if llms_result.error_type:
+        stats.endpoint_error_reasons[f"llms_txt:{llms_result.error_type}"] += 1
+    if robots_result.error_type:
+        stats.endpoint_error_reasons[f"robots_txt:{robots_result.error_type}"] += 1
 
-        if name == "llms_txt":
-            llms_status = classify_llms_txt(result)
-            stats.endpoint_statuses[f"llms_txt:{llms_status}"] += 1
-        else:
-            robots_status, robots_policies = classify_robots_txt(result)
-            stats.endpoint_statuses[f"robots_txt:{robots_status}"] += 1
-        if result.error_type:
-            stats.endpoint_error_reasons[f"{name}:{result.error_type}"] += 1
-
-    return build_output_row(item.domain, llms_status, robots_status, robots_policies)
-
-
-def validate_output_row(row: Mapping[str, Any]) -> None:
-    if list(row.keys()) != OUTPUT_COLUMNS:
-        raise ValueError("Output row does not match the CSV schema.")
-    for column, value in row.items():
-        if isinstance(value, dict | list | tuple | set):
-            raise TypeError(f"Output row column `{column}` contains nested data.")
-    if row["llms_txt_status"] not in LLMS_STATUSES:
-        raise ValueError("Output row has an invalid llms.txt status.")
-    if row["robots_txt_status"] not in ROBOTS_STATUSES:
-        raise ValueError("Output row has an invalid robots.txt status.")
-    if row["scan_status"] not in SCAN_STATES:
-        raise ValueError("Output row has an invalid scan status.")
-    for column in (
-        "training_bots_restricted",
-        "search_bots_restricted",
-        "user_fetch_bots_restricted",
-    ):
-        if row[column] not in RESTRICTED_STATES:
-            raise ValueError(f"Output row has an invalid {column} value.")
-    if row["has_llms_txt"] not in {True, False, None}:
-        raise ValueError("Output row has an invalid has_llms_txt value.")
-    if row["has_explicit_ai_policy"] not in {True, False, None}:
-        raise ValueError("Output row has an invalid has_explicit_ai_policy value.")
-    if row["any_ai_bot_restricted"] not in {True, False, None}:
-        raise ValueError("Output row has an invalid any_ai_bot_restricted value.")
-
-
-def validate_output_contract(
-    domains: Sequence[DomainInput], latest_rows: Mapping[str, Mapping[str, Any]]
-) -> None:
-    if len(set(OUTPUT_COLUMNS)) != len(OUTPUT_COLUMNS):
-        raise ValueError("Output schema contains duplicate column names.")
-    if any(
-        not column or not re.fullmatch(r"[a-z][a-z0-9_]*", column)
-        for column in OUTPUT_COLUMNS
-    ):
-        raise ValueError("Output schema contains invalid column names.")
-    forbidden_columns = {
-        "rank",
-        "ranking",
-        "row_rank",
-        "source_rank",
-        "index",
-        "row_number",
-        "",
-    }
-    if forbidden_columns & set(OUTPUT_COLUMNS):
-        raise ValueError("Output schema contains an index or rank-like column.")
-    domain_values = [item.domain for item in domains]
-    if len(set(domain_values)) != len(domain_values):
-        raise ValueError("Input domains contain duplicates after normalization.")
-    projected_row_count = sum(1 for item in domains if item.domain in latest_rows)
-    if projected_row_count > len(domains):
-        raise ValueError("Output row count would exceed input domain count.")
-    if DEBUG_VALIDATE_ROWS:
-        for row in latest_rows.values():
-            validate_output_row(row)
+    return build_output_row(
+        item.rank, item.domain, llms_status, robots_status, robots_policies
+    )
 
 
 def csv_value(value: Any) -> Any:
@@ -1015,7 +849,6 @@ def csv_value(value: Any) -> Any:
 def write_output_csv(
     domains: Sequence[DomainInput], latest_rows: Mapping[str, Mapping[str, Any]]
 ) -> int:
-    validate_output_contract(domains, latest_rows)
     OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     temporary = OUTPUT_PATH.with_name(f".{OUTPUT_PATH.name}.tmp")
     count = 0
@@ -1027,6 +860,7 @@ def write_output_csv(
             row = latest_rows.get(item.domain)
             if row is None:
                 continue
+            # Keep the CSV contract explicit for downstream readr/tidyverse loading.
             writer.writerow(
                 {column: csv_value(row[column]) for column in OUTPUT_COLUMNS}
             )
@@ -1052,13 +886,11 @@ def log_scan_summary(stats: RequestStats) -> None:
     p95_duration = percentile(stats.request_durations, 0.95)
     LOGGER.info(
         "HTTP attempts=%s redirects=%s http_fallbacks=%s "
-        "http_fallback_recoveries=%s retries=%s retry_recoveries=%s",
+        "http_fallback_recoveries=%s",
         stats.attempts,
         stats.redirects,
         stats.http_fallbacks,
         stats.http_fallback_recoveries,
-        stats.retries,
-        stats.retry_recoveries,
     )
     if median_duration is not None and p95_duration is not None:
         LOGGER.info(
@@ -1077,7 +909,6 @@ def log_scan_summary(stats: RequestStats) -> None:
 
 async def collect(
     domains: Sequence[DomainInput],
-    settings: CollectionSettings,
 ) -> int:
     started = time.perf_counter()
     latest_rows: dict[str, dict[str, Any]] = {}
@@ -1090,16 +921,16 @@ async def collect(
 
     if pending:
         timeout = httpx.Timeout(
-            connect=settings.connect_timeout,
-            read=settings.read_timeout,
-            write=settings.write_timeout,
-            pool=settings.pool_timeout,
+            connect=CONNECT_TIMEOUT,
+            read=READ_TIMEOUT,
+            write=WRITE_TIMEOUT,
+            pool=POOL_TIMEOUT,
         )
         limits = httpx.Limits(
-            max_connections=max(settings.request_concurrency * 2, 60),
-            max_keepalive_connections=max(settings.request_concurrency, 30),
+            max_connections=max(REQUEST_CONCURRENCY * 2, 60),
+            max_keepalive_connections=max(REQUEST_CONCURRENCY, 30),
         )
-        semaphore = asyncio.Semaphore(settings.request_concurrency)
+        semaphore = asyncio.Semaphore(REQUEST_CONCURRENCY)
         safety_cache = HostSafetyCache()
 
         async with httpx.AsyncClient(
@@ -1113,11 +944,8 @@ async def collect(
                 "Accept": "text/plain,text/markdown,*/*;q=0.1",
             },
         ) as client:
-            worker_count = min(settings.workers, len(pending))
+            worker_count = min(DOMAIN_WORKERS, len(pending))
             input_queue: asyncio.Queue[DomainInput | None] = asyncio.Queue(
-                maxsize=max(worker_count * 2, 1)
-            )
-            result_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
                 maxsize=max(worker_count * 2, 1)
             )
 
@@ -1128,6 +956,7 @@ async def collect(
                     await input_queue.put(None)
 
             async def worker() -> None:
+                nonlocal last_progress, last_progress_processed, processed_this_run
                 while True:
                     item = await input_queue.get()
                     try:
@@ -1140,53 +969,45 @@ async def collect(
                                 semaphore,
                                 safety_cache,
                                 stats,
-                                settings,
                             )
-                            await result_queue.put(row)
                         except Exception:
-                            await result_queue.put(
-                                build_output_row(
-                                    item.domain,
-                                    "network_error",
-                                    "network_error",
-                                    None,
-                                )
+                            row = build_output_row(
+                                item.rank,
+                                item.domain,
+                                "network_error",
+                                "network_error",
+                                None,
                             )
+                        latest_rows[str(row["domain"])] = row
+                        processed_this_run += 1
+
+                        now = time.monotonic()
+                        if now - last_progress >= PROGRESS_SECONDS:
+                            rate = processed_this_run / max(
+                                time.perf_counter() - started, 0.1
+                            )
+                            interval_elapsed = max(now - last_progress, 0.1)
+                            interval_processed = (
+                                processed_this_run - last_progress_processed
+                            )
+                            interval_rate = interval_processed / interval_elapsed
+                            LOGGER.info(
+                                "Processed %s / %s pending | "
+                                "%.2f recent domains/s | %.2f avg domains/s",
+                                processed_this_run,
+                                len(pending),
+                                interval_rate,
+                                rate,
+                            )
+                            last_progress = now
+                            last_progress_processed = processed_this_run
                     finally:
                         input_queue.task_done()
 
             producer_task = asyncio.create_task(producer())
             workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
 
-            for _ in range(len(pending)):
-                row = await result_queue.get()
-                try:
-                    latest_rows[str(row["domain"])] = row
-                    processed_this_run += 1
-                finally:
-                    result_queue.task_done()
-
-                now = time.monotonic()
-                if now - last_progress >= PROGRESS_SECONDS:
-                    rate = processed_this_run / max(
-                        time.perf_counter() - started, 0.1
-                    )
-                    interval_elapsed = max(now - last_progress, 0.1)
-                    interval_processed = processed_this_run - last_progress_processed
-                    interval_rate = interval_processed / interval_elapsed
-                    LOGGER.info(
-                        "Processed %s / %s pending | %.2f recent domains/s | "
-                        "%.2f avg domains/s",
-                        processed_this_run,
-                        len(pending),
-                        interval_rate,
-                        rate,
-                    )
-                    last_progress = now
-                    last_progress_processed = processed_this_run
-
             await input_queue.join()
-            await result_queue.join()
             await producer_task
             await asyncio.gather(*workers)
 
@@ -1197,11 +1018,11 @@ async def collect(
 
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if len(arguments) != 1:
-        print(f"Usage: {Path(sys.argv[0]).name} INPUT", file=sys.stderr)
+    if len(arguments) > 1:
+        print(f"Usage: {Path(sys.argv[0]).name} [INPUT]", file=sys.stderr)
         return 2
 
-    input_path = Path(arguments[0])
+    input_path = Path(arguments[0]) if arguments else DEFAULT_INPUT_PATH
     if not input_path.is_file():
         print(f"input file does not exist: {input_path}", file=sys.stderr)
         return 2
@@ -1212,10 +1033,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
     try:
-        domains, _skipped = load_domains(input_path)
+        domains = load_domains(input_path)
         if not domains:
             raise ValueError(f"No valid domains found in {input_path}")
-        return asyncio.run(collect(domains, CollectionSettings()))
+        return asyncio.run(collect(domains))
     except KeyboardInterrupt:
         LOGGER.warning("Interrupted. Re-run the command to start a fresh collection.")
         return 130
