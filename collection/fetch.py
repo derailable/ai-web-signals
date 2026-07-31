@@ -16,8 +16,9 @@ from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from random import Random
 from typing import Any
-from urllib.parse import urljoin, urlparse, urlunparse
+from urllib.parse import ParseResult, urljoin, urlparse
 
 import httpx
 from h2.exceptions import ProtocolError as H2ProtocolError
@@ -34,10 +35,11 @@ DEFAULT_INPUT_PATH = REPO_ROOT / "data/input/tranco-top-100000.csv"
 
 USER_AGENT = f"AIWebSignals/{VERSION} (+{REPOSITORY_URL})"
 TRANCO_SCAN_SCOPE = 100000
-DOMAIN_WORKERS = 50
-REQUEST_CONCURRENCY = 50
-PROGRESS_SECONDS = 300.0
+DOMAIN_WORKERS = 100
+REQUEST_CONCURRENCY = 100
+PROGRESS_SECONDS = 60.0
 REDIRECT_LIMIT = 4
+REQUEST_DURATION_SAMPLE_LIMIT = 20_000
 LLMS_SAMPLE_LIMIT = 256 * 1024
 ROBOTS_SAMPLE_LIMIT = 512 * 1024
 CONNECT_TIMEOUT = 3.0
@@ -46,9 +48,7 @@ WRITE_TIMEOUT = 3.0
 POOL_TIMEOUT = 3.0
 DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$")
 CHARSET_RE = re.compile(r"charset\s*=\s*[\"']?([^;\"'\s]+)", re.IGNORECASE)
-HTML_MARKUP_RE = re.compile(
-    r"<(?:title|div|span|script|style|meta|form|nav|footer)\b"
-)
+HTML_MARKUP_RE = re.compile(r"<(?:title|div|span|script|style|meta|form|nav|footer)\b")
 
 # First-party docs checked 2026-07-29:
 # OpenAI: https://developers.openai.com/api/docs/bots
@@ -89,9 +89,7 @@ TRACKED_BOT_TOKENS = [
     token for group_tokens in BOT_GROUPS.values() for token in group_tokens
 ]
 UNKNOWN_ROBOTS_POLICIES = {token: "unknown" for token in TRACKED_BOT_TOKENS}
-ALLOW_DEFAULT_ROBOTS_POLICIES = {
-    token: "allow_default" for token in TRACKED_BOT_TOKENS
-}
+ALLOW_DEFAULT_ROBOTS_POLICIES = {token: "allow_default" for token in TRACKED_BOT_TOKENS}
 
 OUTPUT_COLUMNS = [
     "rank",
@@ -129,8 +127,41 @@ class RequestStats:
     http_fallbacks: int = 0
     http_fallback_recoveries: int = 0
     request_durations: list[float] = field(default_factory=list)
+    request_duration_count: int = 0
+    duration_random: Random = field(default_factory=lambda: Random(0))
     endpoint_statuses: Counter[str] = field(default_factory=Counter)
     endpoint_error_reasons: Counter[str] = field(default_factory=Counter)
+
+    def record_duration(self, duration: float) -> None:
+        self.request_duration_count += 1
+        if len(self.request_durations) < REQUEST_DURATION_SAMPLE_LIMIT:
+            self.request_durations.append(duration)
+            return
+        index = self.duration_random.randrange(self.request_duration_count)
+        if index < REQUEST_DURATION_SAMPLE_LIMIT:
+            self.request_durations[index] = duration
+
+
+@dataclass
+class ProgressStats:
+    total: int
+    started: float = field(default_factory=time.perf_counter)
+    last_report: float = field(default_factory=time.monotonic)
+    processed_at_last_report: int = 0
+    processed: int = 0
+    complete: int = 0
+    partial: int = 0
+    failed: int = 0
+
+    def record_row(self, row: Mapping[str, Any]) -> None:
+        self.processed += 1
+        status = row["scan_status"]
+        if status == "complete":
+            self.complete += 1
+        elif status == "partial":
+            self.partial += 1
+        else:
+            self.failed += 1
 
 
 class HostSafetyCache:
@@ -201,9 +232,7 @@ def normalize_domain(raw: str) -> tuple[str | None, str | None]:
         return None, "domain is too long"
 
     labels = value.split(".")
-    if len(labels) < 2 or not all(
-        DOMAIN_LABEL_RE.fullmatch(label) for label in labels
-    ):
+    if len(labels) < 2 or not all(DOMAIN_LABEL_RE.fullmatch(label) for label in labels):
         return None, "contains an invalid DNS label"
 
     try:
@@ -243,13 +272,14 @@ def load_domains(
             expected_rank = len(domains) + 1
             if rank != expected_rank:
                 raise ValueError(
-                    f"Input row {row_number} has rank {rank}; "
-                    f"expected {expected_rank}."
+                    f"Input row {row_number} has rank {rank}; expected {expected_rank}."
                 )
 
             normalized, reason = normalize_domain(row.get("domain", "") or "")
             if reason:
-                raise ValueError(f"Input row {row_number} has invalid domain: {reason}.")
+                raise ValueError(
+                    f"Input row {row_number} has invalid domain: {reason}."
+                )
             assert normalized is not None
             if normalized in seen_domains:
                 raise ValueError(f"Input contains duplicate domain {normalized}.")
@@ -298,13 +328,33 @@ def resolve_host_safety(host: str) -> str | None:
     return None
 
 
-async def validate_url(url: str, safety_cache: HostSafetyCache) -> str | None:
+def validate_port(parsed: ParseResult) -> str | None:
+    try:
+        port = parsed.port
+    except ValueError:
+        return "unsafe_port"
+    if parsed.scheme == "http" and port not in {None, 80}:
+        return "unsafe_port"
+    if parsed.scheme == "https" and port not in {None, 443}:
+        return "unsafe_port"
+    return None
+
+
+async def validate_url(
+    url: str, safety_cache: HostSafetyCache
+) -> tuple[ParseResult | None, str | None]:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
-        return "invalid_url"
+        return None, "invalid_url"
     if parsed.username is not None or parsed.password is not None:
-        return "invalid_url"
-    return await safety_cache.check(parsed.hostname)
+        return None, "invalid_url"
+    port_error = validate_port(parsed)
+    if port_error:
+        return None, port_error
+    safety_error = await safety_cache.check(parsed.hostname)
+    if safety_error:
+        return None, safety_error
+    return parsed, None
 
 
 def classify_httpx_error(error: Exception) -> str:
@@ -357,28 +407,20 @@ def classify_httpx_error(error: Exception) -> str:
 
 
 async def read_limited(response: httpx.Response, limit: int) -> bytes:
-    chunks: list[bytes] = []
-    total = 0
+    body = bytearray()
     try:
         async for chunk in response.aiter_bytes():
             if not chunk:
                 continue
-            chunks.append(chunk)
-            total += len(chunk)
-            if total > limit:
+            remaining = limit - len(body)
+            if remaining <= 0:
+                break
+            body.extend(chunk[:remaining])
+            if len(body) >= limit:
                 break
     finally:
         await response.aclose()
-    body = b"".join(chunks)
-    return body[:limit]
-
-
-def redacted_url(url: str) -> str:
-    parsed = urlparse(url)
-    netloc = parsed.hostname or ""
-    if parsed.port is not None:
-        netloc = f"{netloc}:{parsed.port}"
-    return urlunparse((parsed.scheme, netloc, parsed.path, "", "", ""))
+    return bytes(body)
 
 
 async def fetch_once(
@@ -394,14 +436,14 @@ async def fetch_once(
 
     try:
         while True:
-            safety_error = await validate_url(current_url, safety_cache)
+            _parsed, safety_error = await validate_url(current_url, safety_cache)
             if safety_error:
                 return FetchResult(None, None, b"", safety_error)
 
             async with semaphore:
                 stats.attempts += 1
                 attempt_started = time.perf_counter()
-                request = client.build_request("GET", redacted_url(current_url))
+                request = client.build_request("GET", current_url)
                 try:
                     response = await client.send(request, stream=True)
 
@@ -415,8 +457,6 @@ async def fetch_once(
                         if redirects > REDIRECT_LIMIT:
                             return FetchResult(None, None, b"", "redirect_error")
                         current_url = urljoin(current_url, location)
-                        if urlparse(current_url).scheme not in {"http", "https"}:
-                            return FetchResult(None, None, b"", "unsafe_redirect")
                         continue
 
                     body = await read_limited(response, body_limit)
@@ -427,7 +467,7 @@ async def fetch_once(
                         None,
                     )
                 finally:
-                    stats.request_durations.append(time.perf_counter() - attempt_started)
+                    stats.record_duration(time.perf_counter() - attempt_started)
 
     except (httpx.HTTPError, H2ProtocolError) as error:
         return FetchResult(None, None, b"", classify_httpx_error(error))
@@ -774,12 +814,8 @@ def build_output_row(
         "has_llms_txt": has_llms_value(llms_status),
         "llms_txt_status": llms_status,
         "robots_txt_status": robots_status,
-        "has_explicit_ai_policy": has_explicit_ai_policy_value(
-            robots_status, policies
-        ),
-        "any_ai_bot_restricted": any_ai_bot_restricted_value(
-            robots_status, policies
-        ),
+        "has_explicit_ai_policy": has_explicit_ai_policy_value(robots_status, policies),
+        "any_ai_bot_restricted": any_ai_bot_restricted_value(robots_status, policies),
         **{
             column: summarize_blocking(policies, bots)
             for column, bots in BOT_GROUPS.items()
@@ -815,12 +851,7 @@ async def process_domain(
             "/robots.txt",
             ROBOTS_SAMPLE_LIMIT,
         ),
-        return_exceptions=True,
     )
-    if isinstance(llms_result, Exception):
-        llms_result = FetchResult(None, None, b"", "internal_error")
-    if isinstance(robots_result, Exception):
-        robots_result = FetchResult(None, None, b"", "internal_error")
 
     llms_status = classify_llms_txt(llms_result)
     robots_status, robots_policies = classify_robots_txt(robots_result)
@@ -881,25 +912,33 @@ def percentile(values: Sequence[float], quantile: float) -> float | None:
     return sorted_values[index]
 
 
-def log_scan_summary(stats: RequestStats) -> None:
+def log_scan_summary(stats: RequestStats, progress: ProgressStats) -> None:
     median_duration = percentile(stats.request_durations, 0.50)
     p95_duration = percentile(stats.request_durations, 0.95)
     LOGGER.info(
         "HTTP attempts=%s redirects=%s http_fallbacks=%s "
-        "http_fallback_recoveries=%s",
+        "http_fallback_recoveries=%s complete=%s partial=%s failed=%s",
         stats.attempts,
         stats.redirects,
         stats.http_fallbacks,
         stats.http_fallback_recoveries,
+        progress.complete,
+        progress.partial,
+        progress.failed,
     )
     if median_duration is not None and p95_duration is not None:
         LOGGER.info(
-            "Request duration median=%.3fs p95=%.3fs",
+            "Sampled request duration median=%.3fs p95=%.3fs "
+            "(%s of %s attempts sampled)",
             median_duration,
             p95_duration,
+            len(stats.request_durations),
+            stats.request_duration_count,
         )
     if stats.endpoint_statuses:
-        LOGGER.info("Endpoint statuses: %s", dict(stats.endpoint_statuses.most_common()))
+        LOGGER.info(
+            "Endpoint statuses: %s", dict(stats.endpoint_statuses.most_common())
+        )
     if stats.endpoint_error_reasons:
         LOGGER.info(
             "Network error reasons: %s",
@@ -907,17 +946,40 @@ def log_scan_summary(stats: RequestStats) -> None:
         )
 
 
+def maybe_log_progress(progress: ProgressStats, stats: RequestStats) -> None:
+    now = time.monotonic()
+    if now - progress.last_report < PROGRESS_SECONDS:
+        return
+    elapsed = max(time.perf_counter() - progress.started, 0.1)
+    interval_elapsed = max(now - progress.last_report, 0.1)
+    interval_processed = progress.processed - progress.processed_at_last_report
+    LOGGER.info(
+        "Processed %s / %s domains (%.2f%%) | %.2f recent domains/s | "
+        "%.2f avg domains/s | complete=%s partial=%s failed=%s | "
+        "http_attempts=%s http_fallbacks=%s",
+        progress.processed,
+        progress.total,
+        progress.processed / max(progress.total, 1) * 100,
+        interval_processed / interval_elapsed,
+        progress.processed / elapsed,
+        progress.complete,
+        progress.partial,
+        progress.failed,
+        stats.attempts,
+        stats.http_fallbacks,
+    )
+    progress.last_report = now
+    progress.processed_at_last_report = progress.processed
+
+
 async def collect(
     domains: Sequence[DomainInput],
 ) -> int:
-    started = time.perf_counter()
     latest_rows: dict[str, dict[str, Any]] = {}
     pending = list(domains)
 
     stats = RequestStats()
-    processed_this_run = 0
-    last_progress = time.monotonic()
-    last_progress_processed = 0
+    progress = ProgressStats(total=len(pending))
 
     if pending:
         timeout = httpx.Timeout(
@@ -927,11 +989,13 @@ async def collect(
             pool=POOL_TIMEOUT,
         )
         limits = httpx.Limits(
-            max_connections=max(REQUEST_CONCURRENCY * 2, 60),
-            max_keepalive_connections=max(REQUEST_CONCURRENCY, 30),
+            max_connections=REQUEST_CONCURRENCY,
+            max_keepalive_connections=REQUEST_CONCURRENCY,
+            keepalive_expiry=10.0,
         )
         semaphore = asyncio.Semaphore(REQUEST_CONCURRENCY)
         safety_cache = HostSafetyCache()
+        iterator = iter(pending)
 
         async with httpx.AsyncClient(
             follow_redirects=False,
@@ -939,80 +1003,48 @@ async def collect(
             timeout=timeout,
             limits=limits,
             verify=True,
+            trust_env=False,
             headers={
                 "User-Agent": USER_AGENT,
                 "Accept": "text/plain,text/markdown,*/*;q=0.1",
             },
         ) as client:
             worker_count = min(DOMAIN_WORKERS, len(pending))
-            input_queue: asyncio.Queue[DomainInput | None] = asyncio.Queue(
-                maxsize=max(worker_count * 2, 1)
-            )
-
-            async def producer() -> None:
-                for item in pending:
-                    await input_queue.put(item)
-                for _ in range(worker_count):
-                    await input_queue.put(None)
 
             async def worker() -> None:
-                nonlocal last_progress, last_progress_processed, processed_this_run
                 while True:
-                    item = await input_queue.get()
                     try:
-                        if item is None:
-                            return
-                        try:
-                            row = await process_domain(
-                                item,
-                                client,
-                                semaphore,
-                                safety_cache,
-                                stats,
-                            )
-                        except Exception:
-                            row = build_output_row(
-                                item.rank,
-                                item.domain,
-                                "network_error",
-                                "network_error",
-                                None,
-                            )
-                        latest_rows[str(row["domain"])] = row
-                        processed_this_run += 1
+                        item = next(iterator)
+                    except StopIteration:
+                        return
+                    try:
+                        row = await process_domain(
+                            item,
+                            client,
+                            semaphore,
+                            safety_cache,
+                            stats,
+                        )
+                    except Exception:
+                        LOGGER.exception(
+                            "Internal error while processing %s", item.domain
+                        )
+                        stats.endpoint_error_reasons["domain:internal_error"] += 1
+                        row = build_output_row(
+                            item.rank,
+                            item.domain,
+                            "network_error",
+                            "network_error",
+                            None,
+                        )
+                    latest_rows[str(row["domain"])] = row
+                    progress.record_row(row)
+                    maybe_log_progress(progress, stats)
 
-                        now = time.monotonic()
-                        if now - last_progress >= PROGRESS_SECONDS:
-                            rate = processed_this_run / max(
-                                time.perf_counter() - started, 0.1
-                            )
-                            interval_elapsed = max(now - last_progress, 0.1)
-                            interval_processed = (
-                                processed_this_run - last_progress_processed
-                            )
-                            interval_rate = interval_processed / interval_elapsed
-                            LOGGER.info(
-                                "Processed %s / %s pending | "
-                                "%.2f recent domains/s | %.2f avg domains/s",
-                                processed_this_run,
-                                len(pending),
-                                interval_rate,
-                                rate,
-                            )
-                            last_progress = now
-                            last_progress_processed = processed_this_run
-                    finally:
-                        input_queue.task_done()
-
-            producer_task = asyncio.create_task(producer())
-            workers = [asyncio.create_task(worker()) for _ in range(worker_count)]
-
-            await input_queue.join()
-            await producer_task
-            await asyncio.gather(*workers)
+            await asyncio.gather(*(worker() for _ in range(worker_count)))
 
     write_output_csv(domains, latest_rows)
-    log_scan_summary(stats)
+    log_scan_summary(stats, progress)
     return 0
 
 
