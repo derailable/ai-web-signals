@@ -1,7 +1,7 @@
 # ai-web-signals
 
-`ai-web-signals` measures a narrow set of public web signals across
-Cloudflare Radar's Top 100,000 domain population:
+`ai-web-signals` measures a narrow set of public web signals across the Tranco
+Top 100,000 standard domains:
 
 1. whether a plausible `/llms.txt` is published;
 2. how `/robots.txt` declares policy for documented AI-related agents; and
@@ -32,40 +32,54 @@ commit processed CSVs, figures, or rendered reports.
 
 ## Data Source
 
-Use the manually downloaded Cloudflare Radar domain bucket file as the primary
-workflow for this study. A Cloudflare API token is not required.
+This project uses the top 100,000 domains from the standard Tranco list PYGVJ,
+generated on July 29, 2026. The exact list is available at
+<https://tranco-list.eu/list/PYGVJ>.
 
-Cloudflare documents two different domain datasets:
+The standard Tranco list uses pay-level domains and does not include subdomain
+entries. This project preserves Tranco rank and scans the first 100,000 ranked
+domains only. The one-million-domain upstream source is stored at
+`data/input/top-1m.csv`; the normalized scanner input is
+`data/input/tranco-top-100000.csv`.
 
-- the ordered Top 100 list; and
-- unordered popularity bucket datasets, including Top 100,000.
+List PYGVJ aggregates rankings from Chrome UX Report (CrUX), Farsight,
+Majestic, Cloudflare Radar, and Cisco Umbrella over the 30-day period from
+June 30, 2026 through July 29, 2026. Tranco combines the source lists using the
+Dowdall rule, retains pay-level domains, and uses the first one million domains
+from each available source. Tranco rank is an aggregate rank; it is not traffic
+volume, exact visitor count, page views, or a direct measurement of HTTP
+reachability.
 
-For this project, the ordinary Top 100,000 CSV is treated as an unordered
-popularity bucket. Do not treat row order as rank, manufacture sequential ranks,
-or make rank-band claims from this file. The processed CSV intentionally omits
-rank and bucket columns.
+Tranco currently aggregates lists from Cisco Umbrella, Majestic, Farsight, the
+Chrome User Experience Report (CrUX), and Cloudflare Radar. Cisco Umbrella is
+available free of charge; Majestic is available under CC BY 3.0; CrUX is
+available under CC BY-SA 4.0; and Cloudflare Radar is available under
+CC BY-NC 4.0. Tranco is not affiliated with these providers, and Tranco does not
+endorse this project.
 
-Official source reference:
-<https://developers.cloudflare.com/radar/investigate/domain-ranking-datasets/>
+Required citation:
+
+Victor Le Pochat, Tom Van Goethem, Samaneh Tajalizadehkhoob, Maciej
+Korczyński, and Wouter Joosen. 2019. "Tranco: A Research-Oriented Top Sites
+Ranking Hardened Against Manipulation." Proceedings of the 26th Annual Network
+and Distributed System Security Symposium (NDSS 2019).
+<https://doi.org/10.14722/ndss.2019.23386>
 
 ## Expected Input
 
-The collector accepts UTF-8 CSV input with a domain column:
+The collector accepts the prepared UTF-8 Tranco Top 100K CSV:
 
 | Column | Required | Aliases | Behavior |
 | --- | --- | --- | --- |
-| `domain` | Yes | `hostname`, `host`, one unambiguous `*domain*` column | Normalized with IDNA, lowercased, trailing dot removed, validated, and deduplicated |
+| `rank` | Yes | none | Tranco aggregate rank, validated as unique sequential integers from 1 through 100000. |
+| `domain` | Yes | none | Pay-level domain, normalized with IDNA, lowercased, trailing dot removed, validated, and deduplicated. |
 
-An input `rank` or `ranking` column is ignored for the Top 100,000 bucket unless
-the collection method is later changed to a provenance-backed ordered Cloudflare
-Top 100 source. A single `domain` column remains sufficient.
-
-Example:
+The prepared input must contain exactly 100,000 data rows and this header:
 
 ```csv
-domain
-googleapis.com
-googlevideo.com
+rank,domain
+1,example.com
+2,example.org
 ```
 
 ## Collect Data
@@ -94,20 +108,34 @@ If `renv` sandbox activation hangs locally, use:
 RENV_CONFIG_SANDBOX_ENABLED=FALSE Rscript -e 'renv::restore()'
 ```
 
-Set the input path:
+Fetch the standard Tranco list without subdomains and prepare the scanner input:
 
 ```bash
-INPUT=data/input/cloudflare-radar_top-100000-domains_YYYYMMDD-YYYYMMDD.csv
+./scripts/fetch_tranco.sh
 ```
 
-Run the full Top 100,000 collection:
+The fetch script writes:
+
+```text
+data/input/top-1m.csv
+data/input/tranco-top-100000.csv
+data/input/tranco-metadata.json
+```
+
+`top-1m.csv` is the upstream source, `tranco-top-100000.csv` is the normalized
+scanner input, and `tranco-metadata.json` records provenance. Rerunning the
+fetch script overwrites these files and may change the list ID because Tranco
+updates daily.
+
+Run the full Tranco Top 100,000 collection:
 
 ```bash
-uv run python collection/fetch.py "$INPUT"
+uv run python collection/fetch.py
 ```
 
-For a smoke collection, pass a smaller temporary CSV as the input file. The
-collector intentionally accepts only the input path as a CLI argument.
+For a smoke collection, pass a smaller temporary Tranco-style CSV as the input
+file from test code or a local harness. Production scans use
+`data/input/tranco-top-100000.csv`.
 
 Each successful run atomically replaces the previous processed CSV. The
 collector does not write checkpoint or metadata files.
@@ -147,32 +175,6 @@ Network behavior:
 The redirect DNS safety cache is a practical defense, not a proof against every
 DNS-rebinding race inside the HTTP stack.
 
-Diagnostic commands:
-
-```bash
-uv run python collection/diagnose.py spot-check \
-  --output data/diagnostics/spot_check.csv \
-  --concurrency 10 \
-  --total-timeout 15
-```
-
-```bash
-uv run python collection/diagnose.py concurrency-sweep \
-  --output data/diagnostics/concurrency_sweep.csv \
-  --concurrency 5 10 25 50
-```
-
-```bash
-uv run python collection/diagnose.py sample-scan \
-  --sample-size 500 \
-  --concurrency 25 \
-  --output data/diagnostics/sample_scan_500.csv
-```
-
-Diagnostics sample from the existing processed CSV with a fixed seed by
-default. They write separate files under `data/diagnostics/` and do not replace
-the final processed CSV.
-
 ## Processed CSV
 
 Analysis output is atomically written to:
@@ -181,17 +183,18 @@ Analysis output is atomically written to:
 data/processed/domains.csv
 ```
 
-The file is UTF-8 CSV, one row per normalized domain, deterministic in input
-order, and contains no response bodies or raw HTTP diagnostics.
+The file is UTF-8 CSV, one row per normalized ranked domain, deterministic in
+Tranco rank order, and contains no response bodies or raw HTTP diagnostics.
 
 Table grain: one row represents one normalized source domain and its collected
-AI web signals. There are no row names, index columns, rank columns, nested JSON
-cells, or one-row-per-bot expansions.
+AI web signals. There are no row names, index columns, nested JSON cells,
+domain categories, or one-row-per-bot expansions.
 
 Exact ordered schema:
 
 | column | r_type | nullable | allowed_values | description |
 | --- | --- | --- | --- | --- |
+| `rank` | integer | no | 1 through 100000 | Tranco aggregate rank in the selected standard list. |
 | `domain` | character | no | normalized hostname | ASCII/IDNA normalized source domain. |
 | `has_llms_txt` | logical | yes | `true`, `false`, blank | True only for plausible observed `/llms.txt`; blank when unresolved. |
 | `llms_txt_status` | character | no | see endpoint enums | `/llms.txt` endpoint classification. |
@@ -230,8 +233,9 @@ types, duplicates, accidental index columns, parsing problems, or enum values do
 not match the schema.
 
 The Python writer also validates exact column order, unique snake-case names,
-valid logical/status/grouped values, duplicate domains, absence of rank/index
-columns, scalar cells, and output row count before atomically replacing the CSV.
+valid rank/logical/status/grouped values, duplicate ranks and domains, absence
+of accidental index columns, scalar cells, and output row count before atomically
+replacing the CSV.
 
 ### Endpoint Statuses
 
@@ -349,8 +353,8 @@ AI policy.
 | `MistralAI-User` | user-triggered fetching |
 
 `Google-Extended` and `Applebot-Extended` are robots control tokens rather than
-standalone HTTP crawlers. The official Meta crawler URL is linked from
-Cloudflare Radar's verified bot directory.
+standalone HTTP crawlers. The Meta crawler URL is included as a first-party
+reference for the tracked Meta token.
 
 User-triggered agents may be initiated by a person using a product, and some
 first-party documentation states that robots rules may not apply or may
@@ -370,6 +374,16 @@ First-party references:
 
 ## Analysis
 
+Methodology statement:
+
+We scanned the top 100,000 pay-level domains from the standard Tranco list for
+publicly observable AI-related signals in `robots.txt` and `llms.txt`.
+
+Analysis denominators should distinguish all 100,000 ranked domains selected,
+domains for which an HTTP response was observed, domains with successfully
+parsed `robots.txt`, and domains with a determined AI-policy result. Failed
+network observations are not negative AI-policy observations.
+
 Load the processed CSV from R:
 
 ```bash
@@ -387,8 +401,8 @@ publication narrative belong in the R/Quarto phase after the full collection.
 
 ## Limitations
 
-- Cloudflare Top 100,000 bucket membership is coarse popularity evidence, not an
-  exact rank.
+- Tranco rank is an aggregate pay-level-domain rank, not measured traffic,
+  exact visitors, page views, or HTTP reachability.
 - `robots.txt` is a declared crawler policy mechanism, not access control.
 - User-agent strings can be spoofed.
 - Redirect target screening reduces obvious unsafe fetches but cannot guarantee
@@ -398,7 +412,10 @@ publication narrative belong in the R/Quarto phase after the full collection.
 
 ## Attribution And License
 
-Domain population derived from Cloudflare Radar Domain Rankings, published by
-Cloudflare, Inc. Cloudflare is the source of the population, not an author or
-endorser of this analysis. The Cloudflare dataset is made available under
-CC BY-NC 4.0. Project code is MIT licensed.
+Domain population derived from the standard Tranco list. Tranco currently
+aggregates lists from Cisco Umbrella, Majestic, Farsight, the Chrome User
+Experience Report (CrUX), and Cloudflare Radar. Cisco Umbrella is available free
+of charge; Majestic is available under CC BY 3.0; CrUX is available under
+CC BY-SA 4.0; and Cloudflare Radar is available under CC BY-NC 4.0. Tranco is
+not affiliated with these providers and does not endorse this analysis. Project
+code is MIT licensed.
