@@ -1,5 +1,5 @@
 cff-version: 1.2.0
-message: "If you use this software or its generated datasets, cite ai-web-signals and the Cloudflare Radar Domain Rankings source data."
+message: "If you use this software or its generated datasets, cite ai-web-signals, the Tranco ranking paper, and the exact Tranco list used."
 title: "ai-web-signals"
 type: software
 authors:
@@ -9,17 +9,34 @@ url: "https://github.com/derailable/ai-web-signals"
 license: "MIT"
 version: "0.1.0"
 date-released: "2026-07-29"
-abstract: "Collect public AI-related web discovery and crawler-access signals across popular domains sourced from Cloudflare Radar."
+abstract: "Collect public AI-related web discovery and crawler-access signals across the Tranco Top 100,000 standard domains."
 references:
+  - type: conference-paper
+    authors:
+      - family-names: "Le Pochat"
+        given-names: "Victor"
+      - family-names: "Van Goethem"
+        given-names: "Tom"
+      - family-names: "Tajalizadehkhoob"
+        given-names: "Samaneh"
+      - family-names: "Korczyński"
+        given-names: "Maciej"
+      - family-names: "Joosen"
+        given-names: "Wouter"
+    title: "Tranco: A Research-Oriented Top Sites Ranking Hardened Against Manipulation"
+    conference:
+      name: "Proceedings of the 26th Annual Network and Distributed System Security Symposium (NDSS 2019)"
+    doi: "10.14722/ndss.2019.23386"
+    year: 2019
   - type: dataset
     authors:
-      - name: "Cloudflare, Inc."
-    title: "Cloudflare Radar Domain Rankings"
-    url: "https://radar.cloudflare.com/domains"
-    date-accessed: "2026-07-11"
+      - name: "Tranco"
+    title: "Tranco Standard List PYGVJ"
+    url: "https://tranco-list.eu/list/PYGVJ"
+    date-accessed: "2026-07-30"
   - type: website
     authors:
-      - name: "Cloudflare, Inc."
-    title: "Cloudflare Radar"
-    url: "https://radar.cloudflare.com"
-    date-accessed: "2026-07-11"
+      - name: "Tranco"
+    title: "Tranco"
+    url: "https://tranco-list.eu"
+    date-accessed: "2026-07-30"
