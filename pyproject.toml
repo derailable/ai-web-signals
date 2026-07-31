@@ -1,7 +1,7 @@
 [project]
 name = "ai-web-signals"
 version = "0.1.0"
-description = "Collect public AI-related web signals across popular domains sourced from Cloudflare Radar."
+description = "Collect public AI-related web signals across the Tranco Top 100,000 standard domains."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -11,7 +11,7 @@ dependencies = [
 [project.urls]
 Repository = "https://github.com/derailable/ai-web-signals"
 Documentation = "https://github.com/derailable/ai-web-signals#readme"
-"Data source" = "https://radar.cloudflare.com/domains"
+"Data source" = "https://tranco-list.eu"
 
 [dependency-groups]
 dev = [
