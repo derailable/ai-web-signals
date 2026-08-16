@@ -6,7 +6,9 @@ Top 100,000 standard domains:
 1. whether a plausible `/llms.txt` is published;
 2. how `/robots.txt` declares policy for documented AI-related agents; and
 3. whether that policy is explicit to a tracked agent or inherited from
-   `User-agent: *`.
+   `User-agent: *`; and
+4. site-wide `Content-Signal` declarations for search, AI input, and AI
+   training.
 
 This is a measurement of published site policy and public discovery signals. It
 does not prove crawler compliance, AI-provider behavior, search visibility,
@@ -137,8 +139,10 @@ For a smoke collection, pass a smaller temporary Tranco-style CSV as the input
 file from test code or a local harness. Production scans use
 `data/input/tranco-top-100000.csv`.
 
-Each successful run atomically replaces the previous processed CSV. The
-collector does not write checkpoint or metadata files.
+Each successful run stages both processed datasets in rank order in temporary
+local CSVs, validates them, then atomically replaces each previous processed
+CSV only after every input row is written. The collector does not write
+checkpoint or metadata files.
 
 Defaults favor a one-shot collection: 50 domain workers, 50 concurrent HTTP
 requests, 3-second connect timeout, 5-second read timeout, and no retries.
@@ -175,9 +179,9 @@ Network behavior:
 The redirect DNS safety cache is a practical defense, not a proof against every
 DNS-rebinding race inside the HTTP stack.
 
-## Processed CSV
+## Processed CSVs
 
-Analysis output is atomically written to:
+Domain-level analysis output is atomically written to:
 
 ```text
 data/processed/domains.csv
@@ -199,6 +203,9 @@ Exact ordered schema:
 | `has_llms_txt` | logical | yes | `true`, `false`, blank | True only for plausible observed `/llms.txt`; blank when unresolved. |
 | `llms_txt_status` | character | no | see endpoint enums | `/llms.txt` endpoint classification. |
 | `robots_txt_status` | character | no | see endpoint enums | `/robots.txt` endpoint classification. |
+| `content_signal_search` | character | no | see Content Signal enum | Site-wide published preference for search use. |
+| `content_signal_ai_input` | character | no | see Content Signal enum | Site-wide published preference for AI input use. |
+| `content_signal_ai_train` | character | no | see Content Signal enum | Site-wide published preference for AI training use. |
 | `has_explicit_ai_policy` | logical | yes | `true`, `false`, blank | Whether any tracked AI bot is explicitly addressed. |
 | `any_ai_bot_restricted` | logical | yes | `true`, `false`, blank | Whether any tracked AI bot in any group is restricted. |
 | `training_bots_restricted` | character | no | see grouped enum | Restriction summary for training/control tokens. |
@@ -215,27 +222,15 @@ Canonical R import:
 ```r
 source("analysis/data.R")
 
-domains <- readr::read_csv(
-  "data/processed/domains.csv",
-  col_types = domain_col_types,
-  na = "",
-  locale = readr::locale(encoding = "UTF-8"),
-  name_repair = "check_unique",
-  show_col_types = FALSE,
-  progress = FALSE
-)
-
-validate_domains(domains)
+agent_policies <- load_agent_policies(domains = domains)
 ```
 
-`load_domains()` wraps this import and validation. It fails if names, order,
-types, duplicates, accidental index columns, parsing problems, or enum values do
-not match the schema.
+The loaders fail if names, order, types, duplicates, accidental index columns,
+parsing problems, relationships, or enum values do not match their schemas.
 
-The Python writer also validates exact column order, unique snake-case names,
-valid rank/logical/status/grouped values, duplicate ranks and domains, absence
-of accidental index columns, scalar cells, and output row count before atomically
-replacing the CSV.
+The Python writer also validates both staged CSVs before publication, including
+their exact schemas, deterministic ordering, enum values, rank/domain
+relationships, and expected row counts.
 
 ### Endpoint Statuses
 
@@ -271,12 +266,43 @@ network_error
 `robots.txt` classifications describe declared policy shape, not verified
 path-level access or provider compliance.
 
+### Content Signals
+
+The three `content_signal_*` fields retain site-wide `Content-Signal`
+declarations from a `User-agent: *` group. They are separate from crawler access
+policy: `Allow` and `Disallow` classify whether an agent may crawl, while
+Content Signals publish purpose-level preferences for how content may be used.
+
+Each field uses:
+
+```text
+yes
+no
+unspecified
+invalid
+unknown
+```
+
+`yes` and `no` are explicit declarations. `unspecified` means an absent, empty,
+or successfully parsed `robots.txt` has no applicable site-wide declaration for
+that purpose. `invalid` means the purpose was named but its declaration was
+malformed or conflicted with another applicable declaration. `unknown` means
+the robots observation could not be reliably evaluated.
+
+Directive and purpose names are case-insensitive, with optional whitespace
+around comma-separated assignments. Repeated identical values agree;
+conflicting values are `invalid` because the first-party documentation does not
+define precedence. Agent-specific and path-specific declarations are not
+collapsed into domain-wide values. See <https://contentsignals.org/>.
+
+Content Signals are published preferences. They do not prove crawler
+compliance, confer technical access control, or establish legal permission.
+
 ### Internal Policy Enum
 
-The scanner parses per-agent policy values internally before collapsing them to
-the public grouped fields. The public dataset intentionally omits per-agent
-policy columns because it is designed for aggregate analysis and reporting, not
-per-agent policy comparison. Internal policy values use:
+The scanner uses these per-agent policy values to compute the grouped fields in
+`domains.csv` and also retains them at agent grain in
+`data/processed/agent-policies.csv`:
 
 ```text
 allow_default
@@ -305,6 +331,27 @@ Definitions:
 
 A full-site disallow with meaningful `Allow` exceptions is classified as
 partial.
+
+### Agent Policy CSV
+
+`data/processed/agent-policies.csv` contains exactly one row per normalized
+domain and tracked agent. It is ordered by Tranco rank and then by the canonical
+agent order below. For 100,000 domains and the current 15 agents, it contains
+1,500,000 rows.
+
+Exact ordered schema:
+
+| column | r_type | nullable | allowed_values | description |
+| --- | --- | --- | --- | --- |
+| `rank` | integer | no | 1 through 100000 | Tranco aggregate rank. |
+| `domain` | character | no | normalized hostname | Source domain. |
+| `agent` | character | no | tracked agents | Canonical robots token. |
+| `purpose_group` | character | no | `training`, `search`, `user_fetch` | Stable project purpose group. |
+| `policy` | character | no | policy enum above | Parsed agent-specific or inherited crawl policy. |
+
+Like `domains.csv`, this generated dataset is local-only. Agent rows are written
+to a temporary CSV alongside each ordered domain result rather than retained as
+millions of Python dictionaries.
 
 ### Summary Fields
 
@@ -342,6 +389,7 @@ AI policy.
 | `Google-Extended` | training/control token |
 | `Applebot-Extended` | training/control token |
 | `meta-externalagent` | training |
+| `MistralAI-Training` | training |
 | `OAI-SearchBot` | search/indexing |
 | `Claude-SearchBot` | search/indexing |
 | `PerplexityBot` | search/indexing |
