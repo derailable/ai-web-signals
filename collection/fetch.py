@@ -31,12 +31,17 @@ REPOSITORY_URL = "https://github.com/derailable/ai-web-signals"
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "collection" else SCRIPT_DIR
 OUTPUT_PATH = REPO_ROOT / "data/processed/domains.csv"
+AGENT_POLICIES_OUTPUT_PATH = REPO_ROOT / "data/processed/agent-policies.csv"
 DEFAULT_INPUT_PATH = REPO_ROOT / "data/input/tranco-top-100000.csv"
 
 USER_AGENT = f"AIWebSignals/{VERSION} (+{REPOSITORY_URL})"
 TRANCO_SCAN_SCOPE = 100000
-DOMAIN_WORKERS = 100
-REQUEST_CONCURRENCY = 100
+DOMAIN_WORKERS = 50
+REQUEST_CONCURRENCY = 50
+MAX_KEEPALIVE_CONNECTIONS = 20
+KEEPALIVE_EXPIRY = 10.0
+DNS_CACHE_MAX_ENTRIES = 10_000
+MAX_PENDING_OUTPUT_ROWS = 500
 PROGRESS_SECONDS = 60.0
 REDIRECT_LIMIT = 4
 REQUEST_DURATION_SAMPLE_LIMIT = 20_000
@@ -49,8 +54,14 @@ POOL_TIMEOUT = 3.0
 DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$")
 CHARSET_RE = re.compile(r"charset\s*=\s*[\"']?([^;\"'\s]+)", re.IGNORECASE)
 HTML_MARKUP_RE = re.compile(r"<(?:title|div|span|script|style|meta|form|nav|footer)\b")
+CONTENT_SIGNAL_ASSIGNMENT_RE = re.compile(
+    r"^([a-z][a-z0-9-]*)\s*=\s*([a-z]+)$", re.IGNORECASE
+)
+CONTENT_SIGNAL_MENTION_RE = re.compile(
+    r"(?:^|\s)(search|ai-input|ai-train)\s*(?==|$)", re.IGNORECASE
+)
 
-# First-party docs checked 2026-07-29:
+# First-party docs checked 2026-08-16:
 # OpenAI: https://developers.openai.com/api/docs/bots
 # Anthropic: https://support.anthropic.com/en/articles/8896518-does-anthropic-crawl-data-from-the-web-and-how-can-site-owners-block-the-crawler
 # Google: https://developers.google.com/crawling/docs/crawlers-fetchers/google-common-crawlers
@@ -58,6 +69,7 @@ HTML_MARKUP_RE = re.compile(r"<(?:title|div|span|script|style|meta|form|nav|foot
 # Perplexity: https://docs.perplexity.ai/docs/resources/perplexity-crawlers
 # Mistral: https://docs.mistral.ai/robots
 # DuckDuckGo: https://duckduckgo.com/duckduckgo-help-pages/results/duckassistbot
+# Content Signals: https://contentsignals.org/
 # Meta official crawler documentation checked during review:
 # https://developers.facebook.com/docs/sharing/webmasters/web-crawlers
 TRAINING_BOTS = (
@@ -66,6 +78,7 @@ TRAINING_BOTS = (
     "Google-Extended",
     "Applebot-Extended",
     "meta-externalagent",
+    "MistralAI-Training",
 )
 SEARCH_BOTS = (
     "OAI-SearchBot",
@@ -85,11 +98,38 @@ BOT_GROUPS = {
     "search_bots_restricted": SEARCH_BOTS,
     "user_fetch_bots_restricted": USER_FETCH_BOTS,
 }
+PURPOSE_GROUPS = {
+    "training": TRAINING_BOTS,
+    "search": SEARCH_BOTS,
+    "user_fetch": USER_FETCH_BOTS,
+}
 TRACKED_BOT_TOKENS = [
-    token for group_tokens in BOT_GROUPS.values() for token in group_tokens
+    token for group_tokens in PURPOSE_GROUPS.values() for token in group_tokens
 ]
+AGENT_PURPOSE_GROUPS = {
+    token: purpose_group
+    for purpose_group, group_tokens in PURPOSE_GROUPS.items()
+    for token in group_tokens
+}
 UNKNOWN_ROBOTS_POLICIES = {token: "unknown" for token in TRACKED_BOT_TOKENS}
 ALLOW_DEFAULT_ROBOTS_POLICIES = {token: "allow_default" for token in TRACKED_BOT_TOKENS}
+ROBOTS_POLICY_VALUES = {
+    "allow_default",
+    "allow_explicit",
+    "allow_wildcard",
+    "partial_explicit",
+    "partial_wildcard",
+    "blocked_explicit",
+    "blocked_wildcard",
+    "unknown",
+}
+
+CONTENT_SIGNAL_PURPOSES = ("search", "ai-input", "ai-train")
+CONTENT_SIGNAL_VALUES = {"yes", "no", "unspecified", "invalid", "unknown"}
+UNSPECIFIED_CONTENT_SIGNALS = {
+    purpose: "unspecified" for purpose in CONTENT_SIGNAL_PURPOSES
+}
+UNKNOWN_CONTENT_SIGNALS = {purpose: "unknown" for purpose in CONTENT_SIGNAL_PURPOSES}
 
 OUTPUT_COLUMNS = [
     "rank",
@@ -97,6 +137,9 @@ OUTPUT_COLUMNS = [
     "has_llms_txt",
     "llms_txt_status",
     "robots_txt_status",
+    "content_signal_search",
+    "content_signal_ai_input",
+    "content_signal_ai_train",
     "has_explicit_ai_policy",
     "any_ai_bot_restricted",
     "training_bots_restricted",
@@ -104,6 +147,30 @@ OUTPUT_COLUMNS = [
     "user_fetch_bots_restricted",
     "scan_status",
 ]
+
+AGENT_POLICY_COLUMNS = ["rank", "domain", "agent", "purpose_group", "policy"]
+
+LLMS_STATUS_VALUES = {
+    "present",
+    "absent",
+    "empty",
+    "html",
+    "non_text",
+    "http_error",
+    "network_error",
+}
+ROBOTS_STATUS_VALUES = {
+    "parsed",
+    "absent",
+    "empty",
+    "html",
+    "non_text",
+    "unparseable",
+    "http_error",
+    "network_error",
+}
+GROUPED_RESTRICTION_VALUES = {"none", "some", "all", "unknown"}
+SCAN_STATUS_VALUES = {"complete", "partial", "failed"}
 
 
 @dataclass(frozen=True)
@@ -118,6 +185,12 @@ class FetchResult:
     content_type: str | None
     body: bytes
     error_type: str | None
+
+
+@dataclass(frozen=True)
+class ProcessedDomain:
+    domain_row: Mapping[str, Any]
+    agent_policies: Mapping[str, str]
 
 
 @dataclass
@@ -172,7 +245,7 @@ class HostSafetyCache:
     layer.
     """
 
-    def __init__(self, max_entries: int = TRANCO_SCAN_SCOPE) -> None:
+    def __init__(self, max_entries: int = DNS_CACHE_MAX_ENTRIES) -> None:
         self._results: dict[str, str | None] = {}
         self._tasks: dict[str, asyncio.Task[str | None]] = {}
         self._max_entries = max_entries
@@ -614,19 +687,22 @@ def parse_robots_groups(text: str) -> tuple[list[dict[str, Any]], bool]:
     groups: list[dict[str, Any]] = []
     current_agents: list[str] = []
     current_rules: list[dict[str, str]] = []
+    current_content_signals: list[str] = []
     saw_supported_field = False
 
     def flush() -> None:
-        nonlocal current_agents, current_rules
+        nonlocal current_agents, current_rules, current_content_signals
         if current_agents:
             groups.append(
                 {
                     "agents": list(dict.fromkeys(current_agents)),
                     "rules": list(current_rules),
+                    "content_signals": list(current_content_signals),
                 }
             )
         current_agents = []
         current_rules = []
+        current_content_signals = []
 
     for raw_line in text.splitlines():
         line = strip_robots_comment(raw_line).strip()
@@ -642,17 +718,82 @@ def parse_robots_groups(text: str) -> tuple[list[dict[str, Any]], bool]:
             saw_supported_field = True
 
         if key == "user-agent":
-            if current_agents and current_rules:
+            if current_agents and (current_rules or current_content_signals):
                 flush()
             if value:
                 current_agents.append(value.lower())
         elif key in {"allow", "disallow"} and current_agents:
             current_rules.append({"directive": key, "path": value})
+        elif key == "content-signal" and current_agents:
+            current_content_signals.append(value)
         else:
             continue
 
     flush()
     return groups, saw_supported_field
+
+
+def parse_domain_content_signal_declaration(value: str) -> dict[str, str]:
+    """Parse an unscoped Content-Signal declaration for domain-level use.
+
+    The first-party syntax also permits a leading path. Path-scoped declarations
+    cannot be represented truthfully by one domain-level value, so they are not
+    applicable here.
+    """
+
+    declaration = value.strip()
+    if not declaration or declaration.startswith("/"):
+        return {}
+
+    parsed: dict[str, str] = {}
+    for raw_assignment in declaration.split(","):
+        assignment = raw_assignment.strip()
+        if not assignment:
+            continue
+
+        match = CONTENT_SIGNAL_ASSIGNMENT_RE.fullmatch(assignment)
+        if match:
+            purpose = match.group(1).lower()
+            if purpose not in CONTENT_SIGNAL_PURPOSES:
+                continue
+            signal_value = match.group(2).lower()
+            state = signal_value if signal_value in {"yes", "no"} else "invalid"
+            previous = parsed.get(purpose)
+            parsed[purpose] = state if previous in {None, state} else "invalid"
+            continue
+
+        for purpose in CONTENT_SIGNAL_MENTION_RE.findall(assignment):
+            parsed[purpose.lower()] = "invalid"
+
+    return parsed
+
+
+def classify_content_signals(
+    groups: Sequence[Mapping[str, Any]],
+) -> dict[str, str]:
+    observed: dict[str, list[str]] = {
+        purpose: [] for purpose in CONTENT_SIGNAL_PURPOSES
+    }
+
+    for group in groups:
+        agents = [str(agent).lower() for agent in group.get("agents", [])]
+        if "*" not in agents:
+            continue
+        for declaration in group.get("content_signals", []):
+            parsed = parse_domain_content_signal_declaration(str(declaration))
+            for purpose, state in parsed.items():
+                observed[purpose].append(state)
+
+    classifications: dict[str, str] = {}
+    for purpose, states in observed.items():
+        if not states:
+            classifications[purpose] = "unspecified"
+        elif "invalid" in states or len(set(states)) > 1:
+            # The first-party docs define yes/no but no conflict precedence.
+            classifications[purpose] = "invalid"
+        else:
+            classifications[purpose] = states[0]
+    return classifications
 
 
 def classify_selected_rules(rules: Sequence[Mapping[str, str]], provenance: str) -> str:
@@ -694,38 +835,42 @@ def classify_bot_policy(groups: Sequence[Mapping[str, Any]], bot: str) -> str:
     return "allow_default"
 
 
-def classify_robots_txt(result: FetchResult) -> tuple[str, dict[str, str]]:
+def classify_robots_txt(
+    result: FetchResult,
+) -> tuple[str, dict[str, str], dict[str, str]]:
     if result.error_type:
-        return "network_error", UNKNOWN_ROBOTS_POLICIES
+        return "network_error", UNKNOWN_ROBOTS_POLICIES, UNKNOWN_CONTENT_SIGNALS
     if result.status in {404, 410}:
-        return "absent", ALLOW_DEFAULT_ROBOTS_POLICIES
+        return "absent", ALLOW_DEFAULT_ROBOTS_POLICIES, UNSPECIFIED_CONTENT_SIGNALS
     if not is_success(result.status):
-        return "http_error", UNKNOWN_ROBOTS_POLICIES
+        return "http_error", UNKNOWN_ROBOTS_POLICIES, UNKNOWN_CONTENT_SIGNALS
     if not result.body:
-        return "empty", ALLOW_DEFAULT_ROBOTS_POLICIES
+        return "empty", ALLOW_DEFAULT_ROBOTS_POLICIES, UNSPECIFIED_CONTENT_SIGNALS
     if not is_text_content_type(result.content_type):
-        return "non_text", UNKNOWN_ROBOTS_POLICIES
+        return "non_text", UNKNOWN_ROBOTS_POLICIES, UNKNOWN_CONTENT_SIGNALS
     text = decode_text(result.body, result.content_type)
     if text is None:
-        return "non_text", UNKNOWN_ROBOTS_POLICIES
+        return "non_text", UNKNOWN_ROBOTS_POLICIES, UNKNOWN_CONTENT_SIGNALS
     if looks_like_html(text):
-        return "html", UNKNOWN_ROBOTS_POLICIES
+        return "html", UNKNOWN_ROBOTS_POLICIES, UNKNOWN_CONTENT_SIGNALS
     if not text.strip() or not any(
         strip_robots_comment(line).strip() for line in text.splitlines()
     ):
-        return "empty", ALLOW_DEFAULT_ROBOTS_POLICIES
+        return "empty", ALLOW_DEFAULT_ROBOTS_POLICIES, UNSPECIFIED_CONTENT_SIGNALS
 
     try:
         groups, saw_supported_field = parse_robots_groups(text)
-    except Exception:
-        return "unparseable", UNKNOWN_ROBOTS_POLICIES
+    except Exception:  # noqa: BLE001 - any parser failure is an unparseable file
+        return "unparseable", UNKNOWN_ROBOTS_POLICIES, UNKNOWN_CONTENT_SIGNALS
 
     if not saw_supported_field:
-        return "unparseable", UNKNOWN_ROBOTS_POLICIES
+        return "unparseable", UNKNOWN_ROBOTS_POLICIES, UNKNOWN_CONTENT_SIGNALS
 
-    return "parsed", {
-        token: classify_bot_policy(groups, token) for token in TRACKED_BOT_TOKENS
-    }
+    return (
+        "parsed",
+        {token: classify_bot_policy(groups, token) for token in TRACKED_BOT_TOKENS},
+        classify_content_signals(groups),
+    )
 
 
 def llms_completed(classification: str) -> bool:
@@ -806,14 +951,19 @@ def build_output_row(
     llms_status: str,
     robots_status: str,
     robots_policies: Mapping[str, str] | None,
+    content_signals: Mapping[str, str] | None = None,
 ) -> dict[str, Any]:
     policies = robots_policies or {token: "unknown" for token in TRACKED_BOT_TOKENS}
+    signals = content_signals or UNKNOWN_CONTENT_SIGNALS
     row: dict[str, Any] = {
         "rank": rank,
         "domain": domain,
         "has_llms_txt": has_llms_value(llms_status),
         "llms_txt_status": llms_status,
         "robots_txt_status": robots_status,
+        "content_signal_search": signals["search"],
+        "content_signal_ai_input": signals["ai-input"],
+        "content_signal_ai_train": signals["ai-train"],
         "has_explicit_ai_policy": has_explicit_ai_policy_value(robots_status, policies),
         "any_ai_bot_restricted": any_ai_bot_restricted_value(robots_status, policies),
         **{
@@ -831,7 +981,7 @@ async def process_domain(
     semaphore: asyncio.Semaphore,
     safety_cache: HostSafetyCache,
     stats: RequestStats,
-) -> dict[str, Any]:
+) -> ProcessedDomain:
     llms_result, robots_result = await asyncio.gather(
         fetch_endpoint(
             client,
@@ -854,7 +1004,7 @@ async def process_domain(
     )
 
     llms_status = classify_llms_txt(llms_result)
-    robots_status, robots_policies = classify_robots_txt(robots_result)
+    robots_status, robots_policies, content_signals = classify_robots_txt(robots_result)
     stats.endpoint_statuses[f"llms_txt:{llms_status}"] += 1
     stats.endpoint_statuses[f"robots_txt:{robots_status}"] += 1
     if llms_result.error_type:
@@ -862,8 +1012,16 @@ async def process_domain(
     if robots_result.error_type:
         stats.endpoint_error_reasons[f"robots_txt:{robots_result.error_type}"] += 1
 
-    return build_output_row(
-        item.rank, item.domain, llms_status, robots_status, robots_policies
+    return ProcessedDomain(
+        domain_row=build_output_row(
+            item.rank,
+            item.domain,
+            llms_status,
+            robots_status,
+            robots_policies,
+            content_signals,
+        ),
+        agent_policies=robots_policies,
     )
 
 
@@ -877,27 +1035,185 @@ def csv_value(value: Any) -> Any:
     return value
 
 
-def write_output_csv(
-    domains: Sequence[DomainInput], latest_rows: Mapping[str, Mapping[str, Any]]
-) -> int:
-    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    temporary = OUTPUT_PATH.with_name(f".{OUTPUT_PATH.name}.tmp")
-    count = 0
+def build_agent_policy_row(
+    item: DomainInput, agent: str, policy: str
+) -> dict[str, Any]:
+    return {
+        "rank": item.rank,
+        "domain": item.domain,
+        "agent": agent,
+        "purpose_group": AGENT_PURPOSE_GROUPS[agent],
+        "policy": policy,
+    }
 
-    with temporary.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=OUTPUT_COLUMNS)
-        writer.writeheader()
-        for item in domains:
-            row = latest_rows.get(item.domain)
-            if row is None:
-                continue
+
+async def write_ordered_results(
+    domains: Sequence[DomainInput],
+    completed: asyncio.Queue[ProcessedDomain],
+    window: asyncio.Semaphore,
+    domain_writer: csv.DictWriter,
+    agent_policy_writer: csv.DictWriter,
+) -> tuple[int, int]:
+    buffered_results: dict[int, ProcessedDomain] = {}
+    domain_count = 0
+    agent_policy_count = 0
+    next_index = 0
+
+    for _ in domains:
+        result = await completed.get()
+        row = result.domain_row
+        rank = row.get("rank")
+        if isinstance(rank, bool) or not isinstance(rank, int):
+            raise TypeError("Completed row has an invalid rank.")
+        if rank < 1 or rank > len(domains):
+            raise ValueError(f"Completed row has out-of-range rank {rank}.")
+
+        item = domains[rank - 1]
+        if item.rank != rank or row.get("domain") != item.domain:
+            raise ValueError(f"Completed row does not match input rank {rank}.")
+        if rank <= next_index or rank in buffered_results:
+            raise ValueError(f"Completed row has duplicate rank {rank}.")
+        buffered_results[rank] = result
+
+        while next_index < len(domains):
+            expected = domains[next_index]
+            if expected.rank not in buffered_results:
+                break
+            ordered_result = buffered_results.pop(expected.rank)
+            ordered_row = ordered_result.domain_row
             # Keep the CSV contract explicit for downstream readr/tidyverse loading.
-            writer.writerow(
-                {column: csv_value(row[column]) for column in OUTPUT_COLUMNS}
+            domain_writer.writerow(
+                {column: csv_value(ordered_row[column]) for column in OUTPUT_COLUMNS}
             )
+            domain_count += 1
+            for agent in TRACKED_BOT_TOKENS:
+                agent_row = build_agent_policy_row(
+                    expected, agent, ordered_result.agent_policies[agent]
+                )
+                agent_policy_writer.writerow(agent_row)
+                agent_policy_count += 1
+            next_index += 1
+            window.release()
+
+    expected_agent_policy_count = len(domains) * len(TRACKED_BOT_TOKENS)
+    if domain_count != len(domains) or buffered_results:
+        raise RuntimeError(
+            f"Expected {len(domains)} domain rows; wrote {domain_count}."
+        )
+    if agent_policy_count != expected_agent_policy_count:
+        raise RuntimeError(
+            f"Expected {expected_agent_policy_count} agent policy rows; "
+            f"wrote {agent_policy_count}."
+        )
+    return domain_count, agent_policy_count
+
+
+def validate_domains_output(path: Path, domains: Sequence[DomainInput]) -> int:
+    logical_columns = {
+        "has_llms_txt",
+        "has_explicit_ai_policy",
+        "any_ai_bot_restricted",
+    }
+    content_signal_columns = {
+        "content_signal_search",
+        "content_signal_ai_input",
+        "content_signal_ai_train",
+    }
+    grouped_columns = set(BOT_GROUPS)
+
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames != OUTPUT_COLUMNS:
+            raise ValueError("Domain output CSV has an unexpected schema.")
+
+        count = 0
+        for expected in domains:
+            row = next(reader, None)
+            if row is None:
+                raise ValueError(f"Domain output is missing rank {expected.rank}.")
+            if row["rank"] != str(expected.rank) or row["domain"] != expected.domain:
+                raise ValueError(
+                    f"Domain output does not match input rank {expected.rank}."
+                )
+            if any(
+                row[column] not in {"true", "false", ""} for column in logical_columns
+            ):
+                raise ValueError(
+                    f"Domain output rank {expected.rank} has invalid logical data."
+                )
+            if row["llms_txt_status"] not in LLMS_STATUS_VALUES:
+                raise ValueError(
+                    f"Domain output rank {expected.rank} has invalid llms status."
+                )
+            if row["robots_txt_status"] not in ROBOTS_STATUS_VALUES:
+                raise ValueError(
+                    f"Domain output rank {expected.rank} has invalid robots status."
+                )
+            if any(
+                row[column] not in CONTENT_SIGNAL_VALUES
+                for column in content_signal_columns
+            ):
+                raise ValueError(
+                    f"Domain output rank {expected.rank} has invalid Content-Signal data."
+                )
+            if any(
+                row[column] not in GROUPED_RESTRICTION_VALUES
+                for column in grouped_columns
+            ):
+                raise ValueError(
+                    f"Domain output rank {expected.rank} has invalid grouped data."
+                )
+            if row["scan_status"] not in SCAN_STATUS_VALUES:
+                raise ValueError(
+                    f"Domain output rank {expected.rank} has invalid scan status."
+                )
+            if any(value is None for value in row.values()):
+                raise ValueError(
+                    f"Domain output rank {expected.rank} has a non-scalar cell."
+                )
             count += 1
 
-    os.replace(temporary, OUTPUT_PATH)
+        if next(reader, None) is not None:
+            raise ValueError("Domain output has more rows than the input.")
+    return count
+
+
+def validate_agent_policies_output(path: Path, domains: Sequence[DomainInput]) -> int:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames != AGENT_POLICY_COLUMNS:
+            raise ValueError("Agent policy output CSV has an unexpected schema.")
+
+        count = 0
+        for expected in domains:
+            for agent in TRACKED_BOT_TOKENS:
+                row = next(reader, None)
+                if row is None:
+                    raise ValueError(
+                        f"Agent policy output is missing {expected.domain} / {agent}."
+                    )
+                if (
+                    row["rank"] != str(expected.rank)
+                    or row["domain"] != expected.domain
+                    or row["agent"] != agent
+                ):
+                    raise ValueError(
+                        "Agent policy output is not in deterministic rank/agent order."
+                    )
+                if row["purpose_group"] != AGENT_PURPOSE_GROUPS[agent]:
+                    raise ValueError(
+                        f"Agent policy output has the wrong group for {agent}."
+                    )
+                if row["policy"] not in ROBOTS_POLICY_VALUES:
+                    raise ValueError(
+                        f"Agent policy output has an invalid policy for {agent}."
+                    )
+                if any(value is None for value in row.values()):
+                    raise ValueError("Agent policy output has a non-scalar cell.")
+                count += 1
+
+        if next(reader, None) is not None:
+            raise ValueError("Agent policy output has more rows than expected.")
     return count
 
 
@@ -972,78 +1288,187 @@ def maybe_log_progress(progress: ProgressStats, stats: RequestStats) -> None:
     progress.processed_at_last_report = progress.processed
 
 
+def publish_validated_outputs(replacements: Sequence[tuple[Path, Path]]) -> None:
+    """Replace a related set of outputs, rolling back catchable failures."""
+    backups: dict[Path, Path | None] = {}
+    published: list[Path] = []
+    preserved_backups: set[Path] = set()
+
+    try:
+        # Hard links retain the old files without copying these large CSVs.
+        for _temporary, final in replacements:
+            backup = final.with_name(f".{final.name}.previous")
+            backup.unlink(missing_ok=True)
+            if final.exists():
+                os.link(final, backup)
+                backups[final] = backup
+            else:
+                backups[final] = None
+
+        for temporary, final in replacements:
+            os.replace(temporary, final)
+            published.append(final)
+    except BaseException:
+        for final in reversed(published):
+            backup = backups[final]
+            try:
+                if backup is None:
+                    final.unlink(missing_ok=True)
+                else:
+                    os.replace(backup, final)
+            except OSError:
+                LOGGER.critical("Could not restore previous output %s", final)
+                if backup is not None:
+                    preserved_backups.add(backup)
+        raise
+    finally:
+        for backup in backups.values():
+            if backup is not None and backup not in preserved_backups:
+                try:
+                    backup.unlink(missing_ok=True)
+                except OSError:
+                    LOGGER.warning("Could not remove output backup %s", backup)
+
+
 async def collect(
     domains: Sequence[DomainInput],
 ) -> int:
-    latest_rows: dict[str, dict[str, Any]] = {}
-    pending = list(domains)
-
     stats = RequestStats()
-    progress = ProgressStats(total=len(pending))
+    progress = ProgressStats(total=len(domains))
+    OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    AGENT_POLICIES_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+    domain_temporary = OUTPUT_PATH.with_name(f".{OUTPUT_PATH.name}.tmp")
+    agent_policy_temporary = AGENT_POLICIES_OUTPUT_PATH.with_name(
+        f".{AGENT_POLICIES_OUTPUT_PATH.name}.tmp"
+    )
 
-    if pending:
-        timeout = httpx.Timeout(
-            connect=CONNECT_TIMEOUT,
-            read=READ_TIMEOUT,
-            write=WRITE_TIMEOUT,
-            pool=POOL_TIMEOUT,
+    try:
+        with (
+            domain_temporary.open("w", encoding="utf-8", newline="") as domain_handle,
+            agent_policy_temporary.open(
+                "w", encoding="utf-8", newline=""
+            ) as agent_policy_handle,
+        ):
+            domain_writer = csv.DictWriter(domain_handle, fieldnames=OUTPUT_COLUMNS)
+            agent_policy_writer = csv.DictWriter(
+                agent_policy_handle, fieldnames=AGENT_POLICY_COLUMNS
+            )
+            domain_writer.writeheader()
+            agent_policy_writer.writeheader()
+            domain_count = 0
+            agent_policy_count = 0
+
+            if domains:
+                timeout = httpx.Timeout(
+                    connect=CONNECT_TIMEOUT,
+                    read=READ_TIMEOUT,
+                    write=WRITE_TIMEOUT,
+                    pool=POOL_TIMEOUT,
+                )
+                limits = httpx.Limits(
+                    max_connections=REQUEST_CONCURRENCY,
+                    max_keepalive_connections=MAX_KEEPALIVE_CONNECTIONS,
+                    keepalive_expiry=KEEPALIVE_EXPIRY,
+                )
+                semaphore = asyncio.Semaphore(REQUEST_CONCURRENCY)
+                safety_cache = HostSafetyCache()
+                iterator = iter(domains)
+                worker_count = min(DOMAIN_WORKERS, len(domains))
+                window = asyncio.Semaphore(min(MAX_PENDING_OUTPUT_ROWS, len(domains)))
+                completed: asyncio.Queue[ProcessedDomain] = asyncio.Queue()
+
+                async with httpx.AsyncClient(
+                    follow_redirects=False,
+                    http2=True,
+                    timeout=timeout,
+                    limits=limits,
+                    verify=True,
+                    trust_env=False,
+                    headers={
+                        "User-Agent": USER_AGENT,
+                        "Accept": "text/plain,text/markdown,*/*;q=0.1",
+                    },
+                ) as client:
+
+                    async def worker() -> None:
+                        while True:
+                            await window.acquire()
+                            try:
+                                item = next(iterator)
+                            except StopIteration:
+                                window.release()
+                                return
+                            try:
+                                result = await process_domain(
+                                    item,
+                                    client,
+                                    semaphore,
+                                    safety_cache,
+                                    stats,
+                                )
+                            except Exception:
+                                LOGGER.exception(
+                                    "Internal error while processing %s", item.domain
+                                )
+                                stats.endpoint_error_reasons[
+                                    "domain:internal_error"
+                                ] += 1
+                                result = ProcessedDomain(
+                                    domain_row=build_output_row(
+                                        item.rank,
+                                        item.domain,
+                                        "network_error",
+                                        "network_error",
+                                        None,
+                                        UNKNOWN_CONTENT_SIGNALS,
+                                    ),
+                                    agent_policies=UNKNOWN_ROBOTS_POLICIES,
+                                )
+                            await completed.put(result)
+                            progress.record_row(result.domain_row)
+                            maybe_log_progress(progress, stats)
+
+                    async with asyncio.TaskGroup() as tasks:
+                        output_task = tasks.create_task(
+                            write_ordered_results(
+                                domains,
+                                completed,
+                                window,
+                                domain_writer,
+                                agent_policy_writer,
+                            )
+                        )
+                        for _ in range(worker_count):
+                            tasks.create_task(worker())
+                    domain_count, agent_policy_count = output_task.result()
+
+            if domain_count != len(domains):
+                raise RuntimeError(
+                    f"Expected {len(domains)} domain rows; wrote {domain_count}."
+                )
+            expected_agent_policy_count = len(domains) * len(TRACKED_BOT_TOKENS)
+            if agent_policy_count != expected_agent_policy_count:
+                raise RuntimeError(
+                    f"Expected {expected_agent_policy_count} agent policy rows; "
+                    f"wrote {agent_policy_count}."
+                )
+
+        validate_domains_output(domain_temporary, domains)
+        validate_agent_policies_output(agent_policy_temporary, domains)
+        publish_validated_outputs(
+            (
+                (agent_policy_temporary, AGENT_POLICIES_OUTPUT_PATH),
+                (domain_temporary, OUTPUT_PATH),
+            )
         )
-        limits = httpx.Limits(
-            max_connections=REQUEST_CONCURRENCY,
-            max_keepalive_connections=REQUEST_CONCURRENCY,
-            keepalive_expiry=10.0,
-        )
-        semaphore = asyncio.Semaphore(REQUEST_CONCURRENCY)
-        safety_cache = HostSafetyCache()
-        iterator = iter(pending)
+    except BaseException:
+        for temporary in (domain_temporary, agent_policy_temporary):
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                LOGGER.warning("Could not remove temporary output %s", temporary)
+        raise
 
-        async with httpx.AsyncClient(
-            follow_redirects=False,
-            http2=True,
-            timeout=timeout,
-            limits=limits,
-            verify=True,
-            trust_env=False,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept": "text/plain,text/markdown,*/*;q=0.1",
-            },
-        ) as client:
-            worker_count = min(DOMAIN_WORKERS, len(pending))
-
-            async def worker() -> None:
-                while True:
-                    try:
-                        item = next(iterator)
-                    except StopIteration:
-                        return
-                    try:
-                        row = await process_domain(
-                            item,
-                            client,
-                            semaphore,
-                            safety_cache,
-                            stats,
-                        )
-                    except Exception:
-                        LOGGER.exception(
-                            "Internal error while processing %s", item.domain
-                        )
-                        stats.endpoint_error_reasons["domain:internal_error"] += 1
-                        row = build_output_row(
-                            item.rank,
-                            item.domain,
-                            "network_error",
-                            "network_error",
-                            None,
-                        )
-                    latest_rows[str(row["domain"])] = row
-                    progress.record_row(row)
-                    maybe_log_progress(progress, stats)
-
-            await asyncio.gather(*(worker() for _ in range(worker_count)))
-
-    write_output_csv(domains, latest_rows)
     log_scan_summary(stats, progress)
     return 0
 
