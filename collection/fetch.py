@@ -388,7 +388,7 @@ def resolve_host_safety(host: str) -> str | None:
 
     try:
         results = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-    except socket.gaierror:
+    except (socket.gaierror, UnicodeError):
         return "dns_error"
 
     for result in results:
