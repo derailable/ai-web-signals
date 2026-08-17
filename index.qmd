@@ -63,7 +63,7 @@ ggsave(
   "results/figures/02-llms-restriction-overlap.png",
   overlap_plot,
   width = 10,
-  height = 4.6,
+  height = 4.2,
   dpi = 320,
   bg = "white"
 )
@@ -71,7 +71,7 @@ ggsave(
   "results/figures/03-content-signals.png",
   content_signals_plot,
   width = 10,
-  height = 5,
+  height = 4.4,
   dpi = 320,
   bg = "white"
 )
@@ -95,7 +95,7 @@ wildcard_source_metric <- restriction_source_summary |>
   filter(source == "Wildcard rule")
 ```
 
-## Categories differ
+## By category
 
 A plausible `/llms.txt` appeared on
 `r percent(observed_llms_metric$proportion, accuracy = 0.1)` of resolved checks
@@ -116,7 +116,7 @@ category_comparison_plot
 ```{r}
 #| label: discovery-restriction-overlap
 #| echo: false
-#| fig-height: 4.6
+#| fig-height: 4.2
 #| fig-alt: "Two bars show that 83.5 percent of domains with llms.txt and 66.9 percent without llms.txt restricted at least one tracked agent."
 
 overlap_plot
@@ -128,13 +128,13 @@ domain-agent observations came from `User-agent: *`; only
 `r percent(explicit_policy_metric$proportion, accuracy = 0.1)` of resolved
 domains explicitly addressed a tracked AI token.
 
-## Content preferences are mostly unstated
+## Content preferences
 
 ```{r}
 #| label: content-signals
 #| echo: false
-#| fig-height: 5
-#| fig-alt: "A dot plot compares explicit yes and no Content Signal declarations. AI training refusals reach 5.7 percent while all other values remain below 1 percent."
+#| fig-height: 4.4
+#| fig-alt: "A dot plot compares explicit Content Signal declarations. Search opt-ins reach 6.2 percent and AI training opt-outs reach 5.7 percent; the other values remain below 1 percent."
 
 content_signals_plot
 ```
@@ -189,20 +189,16 @@ tibble::tibble(
   )
 ```
 
-## Method and limits
+## Method
 
 The collector requested `/llms.txt` and `/robots.txt` for the 100,000 pay-level
 domains in [Tranco list 645ZX](https://tranco-list.eu/list/645ZX) on 16 August
-2026. Rules cover training/control, AI search, and user-triggered fetch agents.
+2026. It tracks training/control, AI search, and user-triggered fetch agents.
 
-- Results are descriptive; there is no weighting, imputation, or inference.
-- Unresolved observations remain unknown. Missingness may be systematic.
-- Partial restrictions are not full blocks; `/llms.txt` presence says nothing
-  about quality or use.
-- Categories are uneven and exploratory. Published signals do not prove
-  permission, compliance, or enforcement.
-
-Rendering writes CSVs and PNGs to `results/`.
+Results are descriptive, with no weighting, imputation, or inference.
+Unresolved observations remain unknown; missingness may be systematic.
+Categories are exploratory. Partial restrictions are not full blocks, and
+published signals do not establish permission, compliance, enforcement, or use.
 
 ## Citation
 
