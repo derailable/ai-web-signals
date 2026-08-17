@@ -9,12 +9,9 @@ format:
   html:
     toc: true
     toc-depth: 2
-    code-fold: true
-    code-summary: "Show code"
     link-external-newwindow: true
     fig-responsive: true
     embed-resources: false
-    df-print: paged
 
 execute:
   message: false
