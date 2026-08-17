@@ -14,17 +14,17 @@ resolved_explicit <- !is.na(domains$has_explicit_ai_policy)
 resolved_restriction <- !is.na(domains$any_ai_bot_restricted)
 
 key_metrics <- tibble::tribble(
-  ~metric, ~numerator, ~denominator,
-  "Complete endpoint scans", sum(domains$scan_status == "complete"), nrow(domains),
-  "Resolved /llms.txt observations", sum(resolved_llms), nrow(domains),
-  "Observed /llms.txt among resolved observations",
-  sum(domains$has_llms_txt, na.rm = TRUE),
-  sum(resolved_llms),
-  "Resolved tracked-agent policy observations",
-  sum(resolved_restriction),
-  nrow(domains),
-  "Explicit tracked-agent robots policy",
-  sum(domains$has_explicit_ai_policy, na.rm = TRUE),
+  ~metric                                           , ~numerator                             , ~denominator  ,
+  "Complete endpoint scans"                         , sum(domains$scan_status == "complete") , nrow(domains) ,
+  "Resolved /llms.txt observations"                 , sum(resolved_llms)                     , nrow(domains) ,
+  "Observed /llms.txt among resolved observations"  ,
+  sum(domains$has_llms_txt, na.rm = TRUE)           ,
+  sum(resolved_llms)                                ,
+  "Resolved tracked-agent policy observations"      ,
+  sum(resolved_restriction)                         ,
+  nrow(domains)                                     ,
+  "Explicit tracked-agent robots policy"            ,
+  sum(domains$has_explicit_ai_policy, na.rm = TRUE) ,
   sum(resolved_explicit)
 ) |>
   mutate(proportion = numerator / denominator)
