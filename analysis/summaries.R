@@ -82,6 +82,11 @@ content_summary <- domains |>
     values_to = "signal"
   ) |>
   count(purpose, signal, name = "count") |>
+  complete(
+    purpose,
+    signal = content_signal_states,
+    fill = list(count = 0L)
+  ) |>
   group_by(purpose) |>
   mutate(
     total_domains = sum(count),
@@ -124,3 +129,41 @@ overlap_summary <- domains |>
     proportion = count / denominator
   ) |>
   ungroup()
+
+category_summary <- categorized_domains |>
+  group_by(category) |>
+  summarise(
+    selected_domains = n(),
+    complete_scans = sum(scan_status == "complete"),
+    resolved_llms_txt = sum(!is.na(has_llms_txt)),
+    observed_llms_txt = sum(has_llms_txt, na.rm = TRUE),
+    resolved_agent_policy = sum(!is.na(any_ai_bot_restricted)),
+    any_agent_restriction = sum(any_ai_bot_restricted, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  mutate(
+    selected_share = selected_domains / sum(selected_domains),
+    complete_scan_share = complete_scans / selected_domains,
+    observed_llms_txt_share = if_else(
+      resolved_llms_txt > 0,
+      observed_llms_txt / resolved_llms_txt,
+      NA_real_
+    ),
+    any_agent_restriction_share = if_else(
+      resolved_agent_policy > 0,
+      any_agent_restriction / resolved_agent_policy,
+      NA_real_
+    )
+  ) |>
+  arrange(desc(selected_domains), category)
+
+# Keep category comparisons descriptive and readable. The common floor avoids
+# ranking categories from a handful of resolved observations.
+category_min_resolved <- 90L
+
+category_plot_data <- category_summary |>
+  filter(
+    category != "Other / Unknown",
+    resolved_llms_txt >= category_min_resolved,
+    resolved_agent_policy >= category_min_resolved
+  )
