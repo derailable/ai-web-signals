@@ -51,8 +51,8 @@ retrieved_at=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 generated_on="null"
 if [ "${TRANCO_GENERATED_ON:-}" != "" ]; then
   generated_on="\"${TRANCO_GENERATED_ON}\""
-elif [ "$list_id" = "26J39" ]; then
-  generated_on='"2026-08-16"'
+elif [ "$list_id" = "645ZX" ]; then
+  generated_on='"2026-08-15"'
 fi
 
 cat > "$METADATA_FILE" <<EOF
@@ -61,7 +61,7 @@ cat > "$METADATA_FILE" <<EOF
   "list_type": "standard",
   "subdomains": false,
   "list_id": "$list_id",
-  "list_url": "https://tranco-list.eu/list/$list_id/1000000",
+  "list_url": "https://tranco-list.eu/list/$list_id",
   "download_url": "$DOWNLOAD_URL",
   "generated_on": $generated_on,
   "retrieved_at": "$retrieved_at",
