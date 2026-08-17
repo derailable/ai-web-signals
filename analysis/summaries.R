@@ -12,14 +12,9 @@ restrictive_policy_states <- c(
 resolved_llms <- !is.na(domains$has_llms_txt)
 resolved_explicit <- !is.na(domains$has_explicit_ai_policy)
 resolved_restriction <- !is.na(domains$any_ai_bot_restricted)
-resolved_training <- domains$training_bots_restricted != "unknown"
-resolved_search <- domains$search_bots_restricted != "unknown"
-resolved_user_fetch <- domains$user_fetch_bots_restricted != "unknown"
-resolved_training_search <- resolved_training & resolved_search
 
 key_metrics <- tibble::tribble(
   ~metric, ~numerator, ~denominator,
-  "Domains selected", nrow(domains), NA_integer_,
   "Complete endpoint scans", sum(domains$scan_status == "complete"), nrow(domains),
   "Resolved /llms.txt observations", sum(resolved_llms), nrow(domains),
   "Observed /llms.txt among resolved observations",
@@ -30,26 +25,7 @@ key_metrics <- tibble::tribble(
   nrow(domains),
   "Explicit tracked-agent robots policy",
   sum(domains$has_explicit_ai_policy, na.rm = TRUE),
-  sum(resolved_explicit),
-  "Any declared training/control restriction",
-  sum(domains$training_bots_restricted %in% c("some", "all")),
-  sum(resolved_training),
-  "Any declared AI search restriction",
-  sum(domains$search_bots_restricted %in% c("some", "all")),
-  sum(resolved_search),
-  "Any declared user-triggered fetch restriction",
-  sum(domains$user_fetch_bots_restricted %in% c("some", "all")),
-  sum(resolved_user_fetch),
-  "No declared restriction for tracked agents",
-  sum(!domains$any_ai_bot_restricted, na.rm = TRUE),
-  sum(resolved_restriction),
-  "Training/control restricted; AI search unrestricted",
-  sum(
-    resolved_training_search &
-      domains$training_bots_restricted %in% c("some", "all") &
-      domains$search_bots_restricted == "none"
-  ),
-  sum(resolved_training_search)
+  sum(resolved_explicit)
 ) |>
   mutate(proportion = numerator / denominator)
 
@@ -134,7 +110,6 @@ category_summary <- categorized_domains |>
   group_by(category) |>
   summarise(
     selected_domains = n(),
-    complete_scans = sum(scan_status == "complete"),
     resolved_llms_txt = sum(!is.na(has_llms_txt)),
     observed_llms_txt = sum(has_llms_txt, na.rm = TRUE),
     resolved_agent_policy = sum(!is.na(any_ai_bot_restricted)),
@@ -142,8 +117,6 @@ category_summary <- categorized_domains |>
     .groups = "drop"
   ) |>
   mutate(
-    selected_share = selected_domains / sum(selected_domains),
-    complete_scan_share = complete_scans / selected_domains,
     observed_llms_txt_share = if_else(
       resolved_llms_txt > 0,
       observed_llms_txt / resolved_llms_txt,
