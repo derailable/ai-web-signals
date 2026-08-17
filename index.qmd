@@ -79,27 +79,26 @@ ggsave(
   bg = "white"
 )
 
-observed_llms <- key_metrics |>
-  filter(.data$metric == "Observed /llms.txt among resolved observations")
+observed_llms_metric <- key_metrics |>
+  filter(metric == "Observed /llms.txt among resolved observations")
 
-explicit_policy <- key_metrics |>
-  filter(.data$metric == "Explicit tracked-agent robots policy")
+explicit_policy_metric <- key_metrics |>
+  filter(metric == "Explicit tracked-agent robots policy")
 
-complete_scan <- key_metrics |>
-  filter(.data$metric == "Complete endpoint scans")
+complete_scan_metric <- key_metrics |>
+  filter(metric == "Complete endpoint scans")
 
-resolved_llms <- key_metrics |>
-  filter(.data$metric == "Resolved /llms.txt observations")
+resolved_llms_metric <- key_metrics |>
+  filter(metric == "Resolved /llms.txt observations")
 
-resolved_policy <- key_metrics |>
-  filter(.data$metric == "Resolved tracked-agent policy observations")
+resolved_policy_metric <- key_metrics |>
+  filter(metric == "Resolved tracked-agent policy observations")
 
 llms_overlap <- overlap_summary |>
   filter(
-    .data$llms_txt == "Present",
-    .data$restriction == "Any tracked-agent restriction"
+    llms_txt == "Present",
+    restriction == "Any tracked-agent restriction"
   )
-
 ```
 
 AI discovery, crawler access, and content preferences are separate signals.
@@ -118,9 +117,9 @@ llms_presence_plot
 ```
 
 A plausible file appeared on
-`r percent(observed_llms$proportion, accuracy = 0.1)` of resolved observations
-(`r comma(observed_llms$numerator)` of
-`r comma(observed_llms$denominator)`).
+`r percent(observed_llms_metric$proportion, accuracy = 0.1)` of resolved
+observations (`r comma(observed_llms_metric$numerator)` of
+`r comma(observed_llms_metric$denominator)`).
 
 ## `/llms.txt` is not permission
 
@@ -143,8 +142,8 @@ This is a resolved-subset comparison, not evidence of association across all
 
 ## Most restrictions are inherited
 
-Only `r percent(explicit_policy$proportion, accuracy = 0.1)` of resolved domains
-explicitly addressed at least one tracked AI token. Most applicable
+Only `r percent(explicit_policy_metric$proportion, accuracy = 0.1)` of resolved
+domains explicitly addressed at least one tracked AI token. Most applicable
 restrictions instead came from general `User-agent: *` rules.
 
 ```{r}
@@ -180,14 +179,14 @@ content_signals_plot
 tibble::tibble(
   Observation = c("Both endpoints", "/llms.txt", "Tracked-agent policy"),
   Resolved = c(
-    complete_scan$numerator,
-    resolved_llms$numerator,
-    resolved_policy$numerator
+    complete_scan_metric$numerator,
+    resolved_llms_metric$numerator,
+    resolved_policy_metric$numerator
   ),
   Share = c(
-    complete_scan$proportion,
-    resolved_llms$proportion,
-    resolved_policy$proportion
+    complete_scan_metric$proportion,
+    resolved_llms_metric$proportion,
+    resolved_policy_metric$proportion
   )
 ) |>
   gt() |>
