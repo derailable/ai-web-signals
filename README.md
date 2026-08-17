@@ -64,9 +64,9 @@ categories for all 100,000 domains.
 Rscript analysis/categories.R
 ```
 
-The report validates and joins the categories, uses adequately resolved groups
-for two exploratory comparison plots, and writes all category coverage and
-signal rates to `results/tables/category-summary.csv`. The standalone
+The report validates and joins the categories, compares adequately resolved
+groups in one aligned figure, and writes all category coverage and signal rates
+to `results/tables/category-summary.csv`. The standalone
 `analysis/categories.R` script writes the same summary. Treat the labels as
 exploratory: 85,039 domains are `Other / Unknown`, and some categories are
 small.
