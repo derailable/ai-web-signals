@@ -70,11 +70,11 @@ The rendered report writes summary tables to `results/tables/`, figures to
 
 ## Interpretation
 
-The current inventory uses Tranco list 26J39, generated 16 August 2026.[^list]
-The list was fetched and the scan was run on 16 August 2026. Tranco rank is an
-aggregate rank, not traffic volume or HTTP reachability.
+The current inventory uses Tranco list 645ZX, generated on 15 August
+2026.[^list] The list was retrieved and the scan was run on 16 August 2026.
+Tranco rank is an aggregate rank, not traffic volume or HTTP reachability.
 
-[^list]: Available at <https://tranco-list.eu/list/26J39/1000000>.
+[^list]: Available at <https://tranco-list.eu/list/645ZX>.
 
 Analysis distinguishes all selected domains from resolved endpoint and policy
 observations. Unresolved observations are never recoded as negative results.
