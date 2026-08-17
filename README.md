@@ -24,8 +24,11 @@ quarto render
 ```
 
 The collector requests only `/llms.txt` and `/robots.txt`, using HTTPS first,
-bounded concurrency and response sizes, TLS verification, and screened
-redirects.
+conservative bounded concurrency, transient-failure retries with jittered
+backoff, bounded response sizes, TLS verification, and screened redirects. The
+defaults are intentionally suitable for a Raspberry Pi-class host; a full scan
+will take longer in exchange for reducing pressure on the local DNS resolver
+and network connection.
 
 ## Data model
 
@@ -33,6 +36,11 @@ The collector writes two tidy CSVs:
 
 - `data/processed/domains.csv`: one observation per ranked domain;
 - `data/processed/agent-policies.csv`: one observation per domain-agent pair.
+
+`domains.csv` retains each endpoint's final HTTP status or network error type
+and the number of HTTP request attempts. The collector also writes
+`data/processed/scan.log`; its final summary reports retries, fallback
+recoveries, endpoint states, and error-reason counts.
 
 Load them with fixed `readr` column types:
 
