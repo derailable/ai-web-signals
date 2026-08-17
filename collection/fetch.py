@@ -14,7 +14,7 @@ import sys
 import time
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from random import Random
 from typing import Any
@@ -25,21 +25,25 @@ from h2.exceptions import ProtocolError as H2ProtocolError
 
 LOGGER = logging.getLogger(__name__)
 
-VERSION = "3.4.1"
+VERSION = "3.5.0"
 REPOSITORY_URL = "https://github.com/derailable/ai-web-signals"
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent if SCRIPT_DIR.name == "collection" else SCRIPT_DIR
 OUTPUT_PATH = REPO_ROOT / "data/processed/domains.csv"
 AGENT_POLICIES_OUTPUT_PATH = REPO_ROOT / "data/processed/agent-policies.csv"
+SCAN_LOG_PATH = REPO_ROOT / "data/processed/scan.log"
 DEFAULT_INPUT_PATH = REPO_ROOT / "data/input/tranco-top-100000.csv"
 
 USER_AGENT = f"AIWebSignals/{VERSION} (+{REPOSITORY_URL})"
 TRANCO_SCAN_SCOPE = 100000
-DOMAIN_WORKERS = 50
-REQUEST_CONCURRENCY = 50
-MAX_KEEPALIVE_CONNECTIONS = 20
-KEEPALIVE_EXPIRY = 10.0
+# Conservative defaults for a Raspberry Pi-class host and a residential DNS/network
+# connection. Each domain starts two endpoint requests concurrently, so twelve request
+# slots generally mean six domains are active at once.
+DOMAIN_WORKERS = 12
+REQUEST_CONCURRENCY = 12
+MAX_KEEPALIVE_CONNECTIONS = 12
+KEEPALIVE_EXPIRY = 20.0
 DNS_CACHE_MAX_ENTRIES = 10_000
 MAX_PENDING_OUTPUT_ROWS = 500
 PROGRESS_SECONDS = 60.0
@@ -47,10 +51,26 @@ REDIRECT_LIMIT = 4
 REQUEST_DURATION_SAMPLE_LIMIT = 20_000
 LLMS_SAMPLE_LIMIT = 256 * 1024
 ROBOTS_SAMPLE_LIMIT = 512 * 1024
-CONNECT_TIMEOUT = 3.0
-READ_TIMEOUT = 5.0
-WRITE_TIMEOUT = 3.0
-POOL_TIMEOUT = 3.0
+CONNECT_TIMEOUT = 10.0
+READ_TIMEOUT = 15.0
+WRITE_TIMEOUT = 10.0
+POOL_TIMEOUT = 10.0
+MAX_ENDPOINT_ATTEMPTS = 3
+RETRY_BACKOFF_BASE = 0.75
+RETRY_BACKOFF_CAP = 6.0
+RETRY_JITTER = 0.5
+RETRYABLE_HTTP_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+RETRYABLE_ERROR_TYPES = {
+    "connect_timeout",
+    "connection_refused",
+    "connection_reset",
+    "dns_error",
+    "other_network_error",
+    "pool_timeout",
+    "protocol_error",
+    "read_timeout",
+    "write_timeout",
+}
 DOMAIN_LABEL_RE = re.compile(r"^[a-z0-9_](?:[a-z0-9_-]{0,61}[a-z0-9_])?$")
 CHARSET_RE = re.compile(r"charset\s*=\s*[\"']?([^;\"'\s]+)", re.IGNORECASE)
 HTML_MARKUP_RE = re.compile(r"<(?:title|div|span|script|style|meta|form|nav|footer)\b")
@@ -136,7 +156,13 @@ OUTPUT_COLUMNS = [
     "domain",
     "has_llms_txt",
     "llms_txt_status",
+    "llms_txt_http_status",
+    "llms_txt_error_type",
+    "llms_txt_request_attempts",
     "robots_txt_status",
+    "robots_txt_http_status",
+    "robots_txt_error_type",
+    "robots_txt_request_attempts",
     "content_signal_search",
     "content_signal_ai_input",
     "content_signal_ai_train",
@@ -171,6 +197,23 @@ ROBOTS_STATUS_VALUES = {
 }
 GROUPED_RESTRICTION_VALUES = {"none", "some", "all", "unknown"}
 SCAN_STATUS_VALUES = {"complete", "partial", "failed"}
+FETCH_ERROR_VALUES = {
+    "connect_timeout",
+    "connection_refused",
+    "connection_reset",
+    "dns_error",
+    "internal_error",
+    "invalid_url",
+    "other_network_error",
+    "pool_timeout",
+    "private_address",
+    "protocol_error",
+    "read_timeout",
+    "redirect_error",
+    "tls_error",
+    "unsafe_port",
+    "write_timeout",
+}
 
 
 @dataclass(frozen=True)
@@ -185,6 +228,7 @@ class FetchResult:
     content_type: str | None
     body: bytes
     error_type: str | None
+    request_attempts: int = 0
 
 
 @dataclass(frozen=True)
@@ -199,9 +243,12 @@ class RequestStats:
     redirects: int = 0
     http_fallbacks: int = 0
     http_fallback_recoveries: int = 0
+    endpoint_retries: int = 0
+    endpoint_retry_recoveries: int = 0
     request_durations: list[float] = field(default_factory=list)
     request_duration_count: int = 0
     duration_random: Random = field(default_factory=lambda: Random(0))
+    retry_random: Random = field(default_factory=lambda: Random())
     endpoint_statuses: Counter[str] = field(default_factory=Counter)
     endpoint_error_reasons: Counter[str] = field(default_factory=Counter)
 
@@ -506,15 +553,19 @@ async def fetch_once(
 ) -> FetchResult:
     current_url = url
     redirects = 0
+    request_attempts = 0
 
     try:
         while True:
             _parsed, safety_error = await validate_url(current_url, safety_cache)
             if safety_error:
-                return FetchResult(None, None, b"", safety_error)
+                return FetchResult(
+                    None, None, b"", safety_error, request_attempts=request_attempts
+                )
 
             async with semaphore:
                 stats.attempts += 1
+                request_attempts += 1
                 attempt_started = time.perf_counter()
                 request = client.build_request("GET", current_url)
                 try:
@@ -528,7 +579,13 @@ async def fetch_once(
                         redirects += 1
                         stats.redirects += 1
                         if redirects > REDIRECT_LIMIT:
-                            return FetchResult(None, None, b"", "redirect_error")
+                            return FetchResult(
+                                None,
+                                None,
+                                b"",
+                                "redirect_error",
+                                request_attempts=request_attempts,
+                            )
                         current_url = urljoin(current_url, location)
                         continue
 
@@ -538,14 +595,27 @@ async def fetch_once(
                         response.headers.get("content-type"),
                         body,
                         None,
+                        request_attempts=request_attempts,
                     )
                 finally:
                     stats.record_duration(time.perf_counter() - attempt_started)
 
     except (httpx.HTTPError, H2ProtocolError) as error:
-        return FetchResult(None, None, b"", classify_httpx_error(error))
+        return FetchResult(
+            None,
+            None,
+            b"",
+            classify_httpx_error(error),
+            request_attempts=request_attempts,
+        )
 
-    return FetchResult(None, None, b"", "other_network_error")
+    return FetchResult(
+        None,
+        None,
+        b"",
+        "other_network_error",
+        request_attempts=request_attempts,
+    )
 
 
 def should_http_fallback(result: FetchResult) -> bool:
@@ -559,6 +629,18 @@ def should_http_fallback(result: FetchResult) -> bool:
     }
 
 
+def should_retry(result: FetchResult) -> bool:
+    return (
+        result.status in RETRYABLE_HTTP_STATUSES
+        or result.error_type in RETRYABLE_ERROR_TYPES
+    )
+
+
+def retry_delay(attempt: int, stats: RequestStats) -> float:
+    exponential = min(RETRY_BACKOFF_BASE * (2**attempt), RETRY_BACKOFF_CAP)
+    return exponential + stats.retry_random.uniform(0.0, RETRY_JITTER)
+
+
 async def fetch_endpoint(
     client: httpx.AsyncClient,
     semaphore: asyncio.Semaphore,
@@ -568,29 +650,48 @@ async def fetch_endpoint(
     path: str,
     body_limit: int,
 ) -> FetchResult:
-    https_result = await fetch_once(
-        client,
-        semaphore,
-        safety_cache,
-        stats,
-        f"https://{domain}{path}",
-        body_limit,
-    )
-    if not should_http_fallback(https_result):
-        return https_result
+    request_attempts = 0
+    had_retry = False
+    result = FetchResult(None, None, b"", "other_network_error")
 
-    stats.http_fallbacks += 1
-    http_result = await fetch_once(
-        client,
-        semaphore,
-        safety_cache,
-        stats,
-        f"http://{domain}{path}",
-        body_limit,
-    )
-    if http_result.status is not None:
-        stats.http_fallback_recoveries += 1
-    return http_result
+    for attempt in range(MAX_ENDPOINT_ATTEMPTS):
+        https_result = await fetch_once(
+            client,
+            semaphore,
+            safety_cache,
+            stats,
+            f"https://{domain}{path}",
+            body_limit,
+        )
+        request_attempts += https_result.request_attempts
+        result = https_result
+
+        if should_http_fallback(https_result):
+            stats.http_fallbacks += 1
+            http_result = await fetch_once(
+                client,
+                semaphore,
+                safety_cache,
+                stats,
+                f"http://{domain}{path}",
+                body_limit,
+            )
+            request_attempts += http_result.request_attempts
+            result = http_result
+            if http_result.status is not None:
+                stats.http_fallback_recoveries += 1
+
+        if not should_retry(result):
+            if had_retry:
+                stats.endpoint_retry_recoveries += 1
+            return replace(result, request_attempts=request_attempts)
+
+        if attempt + 1 < MAX_ENDPOINT_ATTEMPTS:
+            had_retry = True
+            stats.endpoint_retries += 1
+            await asyncio.sleep(retry_delay(attempt, stats))
+
+    return replace(result, request_attempts=request_attempts)
 
 
 def looks_textual(data: bytes) -> bool:
@@ -952,6 +1053,8 @@ def build_output_row(
     robots_status: str,
     robots_policies: Mapping[str, str] | None,
     content_signals: Mapping[str, str] | None = None,
+    llms_result: FetchResult | None = None,
+    robots_result: FetchResult | None = None,
 ) -> dict[str, Any]:
     policies = robots_policies or {token: "unknown" for token in TRACKED_BOT_TOKENS}
     signals = content_signals or UNKNOWN_CONTENT_SIGNALS
@@ -960,7 +1063,17 @@ def build_output_row(
         "domain": domain,
         "has_llms_txt": has_llms_value(llms_status),
         "llms_txt_status": llms_status,
+        "llms_txt_http_status": llms_result.status if llms_result else None,
+        "llms_txt_error_type": llms_result.error_type if llms_result else None,
+        "llms_txt_request_attempts": (
+            llms_result.request_attempts if llms_result else 0
+        ),
         "robots_txt_status": robots_status,
+        "robots_txt_http_status": robots_result.status if robots_result else None,
+        "robots_txt_error_type": robots_result.error_type if robots_result else None,
+        "robots_txt_request_attempts": (
+            robots_result.request_attempts if robots_result else 0
+        ),
         "content_signal_search": signals["search"],
         "content_signal_ai_input": signals["ai-input"],
         "content_signal_ai_train": signals["ai-train"],
@@ -1020,6 +1133,8 @@ async def process_domain(
             robots_status,
             robots_policies,
             content_signals,
+            llms_result,
+            robots_result,
         ),
         agent_policies=robots_policies,
     )
@@ -1120,6 +1235,12 @@ def validate_domains_output(path: Path, domains: Sequence[DomainInput]) -> int:
         "content_signal_ai_train",
     }
     grouped_columns = set(BOT_GROUPS)
+    http_status_columns = {"llms_txt_http_status", "robots_txt_http_status"}
+    error_columns = {"llms_txt_error_type", "robots_txt_error_type"}
+    request_attempt_columns = {
+        "llms_txt_request_attempts",
+        "robots_txt_request_attempts",
+    }
 
     with path.open("r", encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
@@ -1148,6 +1269,30 @@ def validate_domains_output(path: Path, domains: Sequence[DomainInput]) -> int:
             if row["robots_txt_status"] not in ROBOTS_STATUS_VALUES:
                 raise ValueError(
                     f"Domain output rank {expected.rank} has invalid robots status."
+                )
+            if any(
+                row[column]
+                and (
+                    not row[column].isdecimal()
+                    or not 100 <= int(row[column]) <= 599
+                )
+                for column in http_status_columns
+            ):
+                raise ValueError(
+                    f"Domain output rank {expected.rank} has invalid HTTP status data."
+                )
+            if any(
+                row[column] and row[column] not in FETCH_ERROR_VALUES
+                for column in error_columns
+            ):
+                raise ValueError(
+                    f"Domain output rank {expected.rank} has invalid fetch error data."
+                )
+            if any(
+                not row[column].isdecimal() for column in request_attempt_columns
+            ):
+                raise ValueError(
+                    f"Domain output rank {expected.rank} has invalid attempt data."
                 )
             if any(
                 row[column] not in CONTENT_SIGNAL_VALUES
@@ -1233,11 +1378,14 @@ def log_scan_summary(stats: RequestStats, progress: ProgressStats) -> None:
     p95_duration = percentile(stats.request_durations, 0.95)
     LOGGER.info(
         "HTTP attempts=%s redirects=%s http_fallbacks=%s "
-        "http_fallback_recoveries=%s complete=%s partial=%s failed=%s",
+        "http_fallback_recoveries=%s endpoint_retries=%s "
+        "endpoint_retry_recoveries=%s complete=%s partial=%s failed=%s",
         stats.attempts,
         stats.redirects,
         stats.http_fallbacks,
         stats.http_fallback_recoveries,
+        stats.endpoint_retries,
+        stats.endpoint_retry_recoveries,
         progress.complete,
         progress.partial,
         progress.failed,
@@ -1421,6 +1569,12 @@ async def collect(
                                         "network_error",
                                         None,
                                         UNKNOWN_CONTENT_SIGNALS,
+                                        FetchResult(
+                                            None, None, b"", "internal_error"
+                                        ),
+                                        FetchResult(
+                                            None, None, b"", "internal_error"
+                                        ),
                                     ),
                                     agent_policies=UNKNOWN_ROBOTS_POLICIES,
                                 )
@@ -1484,8 +1638,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"input file does not exist: {input_path}", file=sys.stderr)
         return 2
 
+    SCAN_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        handlers=[
+            logging.StreamHandler(),
+            logging.FileHandler(SCAN_LOG_PATH, mode="w", encoding="utf-8"),
+        ],
     )
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
