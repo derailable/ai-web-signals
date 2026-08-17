@@ -31,9 +31,9 @@ references:
   - type: dataset
     authors:
       - name: "Tranco"
-    title: "Tranco Standard List 26J39"
-    url: "https://tranco-list.eu/list/26J39/1000000"
-    date-released: "2026-08-16"
+    title: "Tranco Standard List 645ZX"
+    url: "https://tranco-list.eu/list/645ZX"
+    date-released: "2026-08-15"
     date-accessed: "2026-08-16"
   - type: website
     authors:
