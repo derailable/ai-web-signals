@@ -23,13 +23,13 @@ key_metrics <- tibble::tribble(
   "Complete endpoint scans", sum(domains$scan_status == "complete"), nrow(domains),
   "Resolved /llms.txt observations", sum(resolved_llms), nrow(domains),
   "Observed /llms.txt among resolved observations",
-  sum(domains$has_llms_txt %in% TRUE),
+  sum(domains$has_llms_txt, na.rm = TRUE),
   sum(resolved_llms),
   "Resolved tracked-agent policy observations",
   sum(resolved_restriction),
   nrow(domains),
   "Explicit tracked-agent robots policy",
-  sum(domains$has_explicit_ai_policy %in% TRUE),
+  sum(domains$has_explicit_ai_policy, na.rm = TRUE),
   sum(resolved_explicit),
   "Any declared training/control restriction",
   sum(domains$training_bots_restricted %in% c("some", "all")),
@@ -41,7 +41,7 @@ key_metrics <- tibble::tribble(
   sum(domains$user_fetch_bots_restricted %in% c("some", "all")),
   sum(resolved_user_fetch),
   "No declared restriction for tracked agents",
-  sum(domains$any_ai_bot_restricted %in% FALSE),
+  sum(!domains$any_ai_bot_restricted, na.rm = TRUE),
   sum(resolved_restriction),
   "Training/control restricted; AI search unrestricted",
   sum(
@@ -51,21 +51,21 @@ key_metrics <- tibble::tribble(
   ),
   sum(resolved_training_search)
 ) |>
-  mutate(proportion = .data$numerator / .data$denominator)
+  mutate(proportion = numerator / denominator)
 
 restriction_source_summary <- agent_policies |>
-  filter(.data$policy %in% restrictive_policy_states) |>
+  filter(policy %in% restrictive_policy_states) |>
   mutate(
     source = if_else(
-      grepl("_explicit$", .data$policy),
+      grepl("_explicit$", policy),
       "Explicit agent rule",
       "Wildcard rule"
     )
   ) |>
-  count(.data$source, name = "count") |>
+  count(source, name = "count") |>
   mutate(
-    denominator = sum(.data$count),
-    proportion = .data$count / .data$denominator
+    denominator = sum(count),
+    proportion = count / denominator
   )
 
 content_signal_states <- c("yes", "no", "unspecified", "invalid", "unknown")
@@ -81,46 +81,46 @@ content_summary <- domains |>
     names_to = "purpose",
     values_to = "signal"
   ) |>
-  count(.data$purpose, .data$signal, name = "count") |>
-  group_by(.data$purpose) |>
+  count(purpose, signal, name = "count") |>
+  group_by(purpose) |>
   mutate(
-    total_domains = sum(.data$count),
-    proportion = .data$count / .data$total_domains,
-    resolved_results = sum(.data$count[.data$signal != "unknown"]),
+    total_domains = sum(count),
+    proportion = count / total_domains,
+    resolved_results = sum(count[signal != "unknown"]),
     resolved_proportion = if_else(
-      .data$signal == "unknown",
+      signal == "unknown",
       NA_real_,
-      .data$count / .data$resolved_results
+      count / resolved_results
     )
   ) |>
   ungroup() |>
   mutate(
     purpose = factor(
-      .data$purpose,
+      purpose,
       levels = c("search", "ai_input", "ai_train"),
       labels = c("Search", "AI input", "AI training")
     ),
     signal = factor(
-      .data$signal,
+      signal,
       levels = content_signal_states,
       labels = c("Yes", "No", "Unspecified", "Invalid", "Unknown")
     )
   )
 
 overlap_summary <- domains |>
-  filter(!is.na(.data$has_llms_txt), !is.na(.data$any_ai_bot_restricted)) |>
+  filter(!is.na(has_llms_txt), !is.na(any_ai_bot_restricted)) |>
   mutate(
-    llms_txt = if_else(.data$has_llms_txt, "Present", "Not present"),
+    llms_txt = if_else(has_llms_txt, "Present", "Not present"),
     restriction = if_else(
-      .data$any_ai_bot_restricted,
+      any_ai_bot_restricted,
       "Any tracked-agent restriction",
       "No tracked-agent restriction"
     )
   ) |>
-  count(.data$llms_txt, .data$restriction, name = "count") |>
-  group_by(.data$llms_txt) |>
+  count(llms_txt, restriction, name = "count") |>
+  group_by(llms_txt) |>
   mutate(
-    denominator = sum(.data$count),
-    proportion = .data$count / .data$denominator
+    denominator = sum(count),
+    proportion = count / denominator
   ) |>
   ungroup()
