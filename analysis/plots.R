@@ -111,10 +111,12 @@ category_comparison_plot <- ggplot(
     label.padding = grid::unit(0.03, "lines")
   ) +
   facet_grid(. ~ signal, scales = "free_x") +
-  scale_color_manual(values = c(
-    "/llms.txt present" = signal_blue,
-    "Tracked-agent restriction" = restriction_red
-  )) +
+  scale_color_manual(
+    values = c(
+      "/llms.txt present" = signal_blue,
+      "Tracked-agent restriction" = restriction_red
+    )
+  ) +
   scale_x_continuous(
     labels = percent_format(accuracy = 1),
     expand = expansion(mult = c(0, 0.28))
