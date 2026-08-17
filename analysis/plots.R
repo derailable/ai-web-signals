@@ -120,15 +120,15 @@ category_comparison_plot <- ggplot(
     expand = expansion(mult = c(0, 0.28))
   ) +
   labs(
-    title = "Categories signal discovery and restriction differently",
+    title = "Software leads /llms.txt; publishing and retail restrict most",
     subtitle = "Ten categories, ordered by /llms.txt rate",
     x = "Share of resolved observations",
     y = NULL,
     caption = paste0(
-      "ChatGPT-assigned categories with at least ",
+      "ChatGPT-assigned; at least ",
       comma(category_min_resolved),
-      " resolved checks for both signals; Other / Unknown omitted.",
-      "\nDashed lines show all-domain rates."
+      " resolved checks per signal. Other / Unknown omitted; ",
+      "dashed lines show all-domain rates."
     )
   ) +
   plot_theme +
@@ -199,7 +199,7 @@ overlap_plot <- ggplot(overlap_plot_data, aes(y = llms_txt)) +
   theme(legend.position = "none")
 
 content_plot_data <- content_summary |>
-  filter(signal %in% c("Yes", "No")) |>
+  filter(signal %in% c("Yes", "No"), count > 0) |>
   mutate(label = percent(resolved_proportion, accuracy = 0.1))
 
 unspecified_range <- content_summary |>
@@ -228,7 +228,7 @@ content_signals_plot <- ggplot(
     expand = expansion(mult = c(0, 0))
   ) +
   labs(
-    title = "Content Signals are nearly absent except for training refusals",
+    title = "Content Signals split: search opt-ins, training opt-outs",
     subtitle = paste0(
       percent(unspecified_range[[1]], accuracy = 0.1),
       " to ",
@@ -238,9 +238,6 @@ content_signals_plot <- ggplot(
     x = "Share of resolved observations",
     y = NULL,
     color = "Declared preference",
-    caption = paste(
-      "Site-wide declarations. AI-training 'No' reached 5.7%;",
-      "all other explicit responses stayed below 1%."
-    )
+    caption = "Site-wide declarations only."
   ) +
   plot_theme
