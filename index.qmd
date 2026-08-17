@@ -1,6 +1,7 @@
 ---
 title: "AI Web Signals"
-subtitle: "Observable AI Policy Signals Across the Tranco Top 100,000"
+subtitle: "How /llms.txt, robots.txt, and Content Signals overlap"
+description: "A scan of the Tranco Top 100,000 shows that AI discovery, crawler access, and content preferences are separate web signals."
 format:
   html:
     fig-width: 10
@@ -14,7 +15,6 @@ format:
 suppressPackageStartupMessages({
   library(dplyr)
   library(gt)
-  library(purrr)
   library(readr)
   library(scales)
 })
@@ -23,375 +23,215 @@ source("analysis/data.R")
 source("analysis/summaries.R")
 source("analysis/plots.R")
 
-domains <- load_domains()
-agent_policies <- load_agent_policies(domains = domains)
-tranco_metadata <- load_tranco_metadata()
-
-scan_quality <- summarise_scan_quality(domains)
-endpoint_statuses <- summarise_endpoint_statuses(domains)
-key_metrics <- summarise_key_metrics(domains)
-rank_summary <- summarise_rank_bands(domains)
-group_summary <- summarise_group_restrictions(domains)
-agent_summary <- summarise_agent_policies(agent_policies)
-content_summary <- summarise_content_signals(domains)
-overlap_summary <- summarise_llms_restriction_overlap(domains)
-
-llms_rank_plot <- plot_llms_by_rank(rank_summary)
-group_restriction_plot <- plot_group_restrictions(group_summary)
-agent_restriction_plot <- plot_agent_restrictions(agent_summary)
-content_signal_plot <- plot_content_signals(content_summary)
-overlap_plot <- plot_llms_restriction_overlap(overlap_summary)
-
-table_outputs <- list(
-  "key-metrics.csv" = key_metrics,
-  "scan-quality.csv" = scan_quality,
-  "endpoint-statuses.csv" = endpoint_statuses,
-  "rank-bands.csv" = rank_summary,
-  "group-restrictions.csv" = group_summary,
-  "agent-policies.csv" = agent_summary,
-  "content-signals.csv" = content_summary,
-  "llms-restriction-overlap.csv" = overlap_summary
-)
-
 dir.create("results/tables", recursive = TRUE, showWarnings = FALSE)
-purrr::iwalk(
-  table_outputs,
-  \(table, filename) readr::write_csv(
-    table,
-    file.path("results", "tables", filename),
-    na = ""
+dir.create("results/figures", recursive = TRUE, showWarnings = FALSE)
+write_csv(
+  key_metrics,
+  "results/tables/key-metrics.csv",
+  na = ""
+)
+write_csv(
+  restriction_source_summary,
+  "results/tables/restriction-rule-sources.csv",
+  na = ""
+)
+write_csv(
+  content_summary,
+  "results/tables/content-signals.csv",
+  na = ""
+)
+write_csv(
+  overlap_summary,
+  "results/tables/llms-restriction-overlap.csv",
+  na = ""
+)
+
+ggsave(
+  "results/figures/01-llms-presence.png",
+  llms_presence_plot,
+  width = 10,
+  height = 4,
+  dpi = 320,
+  bg = "white"
+)
+ggsave(
+  "results/figures/02-llms-restriction-overlap.png",
+  overlap_plot,
+  width = 10,
+  height = 6,
+  dpi = 320,
+  bg = "white"
+)
+ggsave(
+  "results/figures/03-restriction-rule-source.png",
+  restriction_source_plot,
+  width = 10,
+  height = 6,
+  dpi = 320,
+  bg = "white"
+)
+ggsave(
+  "results/figures/04-content-signals.png",
+  content_signals_plot,
+  width = 10,
+  height = 6,
+  dpi = 320,
+  bg = "white"
+)
+
+observed_llms <- key_metrics |>
+  filter(.data$metric == "Observed /llms.txt among resolved observations")
+
+explicit_policy <- key_metrics |>
+  filter(.data$metric == "Explicit tracked-agent robots policy")
+
+complete_scan <- key_metrics |>
+  filter(.data$metric == "Complete endpoint scans")
+
+resolved_llms <- key_metrics |>
+  filter(.data$metric == "Resolved /llms.txt observations")
+
+resolved_policy <- key_metrics |>
+  filter(.data$metric == "Resolved tracked-agent policy observations")
+
+llms_overlap <- overlap_summary |>
+  filter(
+    .data$llms_txt == "Present",
+    .data$restriction == "Any tracked-agent restriction"
   )
-)
 
-save_publication_plot(llms_rank_plot, "01-llms-presence-by-rank.png")
-save_publication_plot(group_restriction_plot, "02-restrictions-by-purpose.png")
-save_publication_plot(
-  agent_restriction_plot,
-  "03-restrictions-by-agent.png",
-  height = 9
-)
-save_publication_plot(content_signal_plot, "04-content-signals.png")
-save_publication_plot(overlap_plot, "05-llms-restriction-overlap.png")
-
-get_metric <- function(name) {
-  metric <- key_metrics |>
-    filter(.data$metric == name) |>
-    select(numerator, denominator, proportion)
-
-  if (nrow(metric) != 1) {
-    stop("Expected exactly one key metric named: ", name, call. = FALSE)
-  }
-
-  metric
-}
-
-most_restricted_agent <- agent_summary |>
-  filter(!is.na(.data$restriction_proportion)) |>
-  slice_max(.data$restriction_proportion, n = 1, with_ties = TRUE)
-
-complete_scan <- get_metric("Complete endpoint scans")
-resolved_llms <- get_metric("Resolved /llms.txt observations")
-observed_llms <- get_metric("Observed /llms.txt among resolved observations")
-resolved_policy <- get_metric("Resolved tracked-agent policy observations")
-training_restriction <- get_metric("Any declared training/control restriction")
-search_restriction <- get_metric("Any declared AI search restriction")
-user_fetch_restriction <- get_metric(
-  "Any declared user-triggered fetch restriction"
-)
-
-complete_scan_pct <- percent(complete_scan$proportion, accuracy = 0.1)
-resolved_llms_pct <- percent(resolved_llms$proportion, accuracy = 0.1)
-llms_txt_pct <- percent(observed_llms$proportion, accuracy = 0.1)
-llms_txt_fraction <- paste0(
-  comma(observed_llms$numerator),
-  " of ",
-  comma(observed_llms$denominator)
-)
-resolved_policy_pct <- percent(resolved_policy$proportion, accuracy = 0.1)
-training_restriction_pct <- percent(
-  training_restriction$proportion,
-  accuracy = 0.1
-)
-search_restriction_pct <- percent(
-  search_restriction$proportion,
-  accuracy = 0.1
-)
-user_fetch_restriction_pct <- percent(
-  user_fetch_restriction$proportion,
-  accuracy = 0.1
-)
-most_restricted_agent_names <- most_restricted_agent$agent |>
-  as.character() |>
-  toString()
-most_restricted_agent_phrase <- if (nrow(most_restricted_agent) == 1) {
-  paste(most_restricted_agent_names, "had")
-} else {
-  paste(most_restricted_agent_names, "shared")
-}
-most_restricted_agent_pct <- percent(
-  most_restricted_agent$restriction_proportion[[1]],
-  accuracy = 0.1
-)
-most_restricted_agent_n <- comma(most_restricted_agent$resolved_results[[1]])
-
-format_metadata_date <- function(value) {
-  format(as.Date(substr(as.character(value), 1, 10)), "%d %B %Y")
-}
-
-list_id <- if (is.null(tranco_metadata$list_id)) {
-  "645ZX"
-} else {
-  tranco_metadata$list_id
-}
-list_url <- if (is.null(tranco_metadata$list_url)) {
-  "https://tranco-list.eu/list/645ZX"
-} else {
-  tranco_metadata$list_url
-}
-retrieved_on <- if (is.null(tranco_metadata$retrieved_at)) {
-  "16 August 2026"
-} else {
-  format_metadata_date(tranco_metadata$retrieved_at)
-}
-generation_note <- if (is.null(tranco_metadata$generated_on)) {
-  if (identical(list_id, "645ZX")) {
-    "The list was generated on 15 August 2026."
-  } else {
-    "The source metadata does not record the list's generation date."
-  }
-} else {
-  paste(
-    "The list was generated on",
-    format_metadata_date(tranco_metadata$generated_on)
-  )
-}
 ```
 
-This descriptive report measures public signals across popular domains: whether
-a plausible `/llms.txt` file was observed, what `robots.txt` rules apply to
-tracked AI-related agents and control tokens, and whether a site-wide
-`Content-Signal` declaration expresses a preference for search, AI input, or AI
-training. These observations describe what a domain published when it was
-scanned; they do not demonstrate crawler compliance, provider behavior, or
-legal permission.
+AI discovery, crawler access, and content preferences are separate signals.
+They can appear together, conflict, or remain unspecified. None establishes
+permission, compliance, or legal status.
 
-## Coverage and selected findings
-
-The study selected `r comma(nrow(domains))` ranked domains. Both endpoint
-observations were complete for `r complete_scan_pct` of them. The `/llms.txt`
-result was resolved for `r resolved_llms_pct` of selected domains; within that
-resolved subset, a plausible file was observed for `r llms_txt_pct`
-(`r llms_txt_fraction`).
-
-A tracked-agent policy result was resolved for `r resolved_policy_pct` of
-selected domains. Within that subset, `r training_restriction_pct` had at least
-one declared restriction for a training/control token. The corresponding
-descriptive proportions were `r search_restriction_pct` for AI search agents and
-`r user_fetch_restriction_pct` for user-triggered fetch agents. These are
-resolved-subset descriptions—not estimates for all 100,000 domains—and
-combine
-partial restrictions with full blocks.
+## `/llms.txt` remains uncommon
 
 ```{r}
-#| label: key-metrics
+#| label: llms-presence
+#| echo: false
+#| fig-height: 4
+#| fig-alt: "A stacked bar comparing resolved domains with and without an observed llms.txt file."
 
-key_metrics |>
-  select(
-    Metric = metric,
-    Numerator = numerator,
-    Denominator = denominator,
-    Proportion = proportion
-  ) |>
-  gt() |>
-  fmt_integer(columns = c("Numerator", "Denominator")) |>
-  fmt_percent(columns = "Proportion", decimals = 1) |>
-  sub_missing(
-    columns = c("Denominator", "Proportion"),
-    missing_text = "—"
-  ) |>
-  tab_header(title = "Coverage and selected descriptive measurements") |>
-  tab_source_note(
-    paste(
-      "Each proportion uses the denominator shown; unresolved observations",
-      "are not recoded as negative results."
-    )
-  ) |>
-  tab_options(table.font.names = "sans")
+llms_presence_plot
 ```
 
-## Collection quality
+A plausible file appeared on
+`r percent(observed_llms$proportion, accuracy = 0.1)` of resolved observations
+(`r comma(observed_llms$numerator)` of
+`r comma(observed_llms$denominator)`).
 
-Unresolved values are analytically distinct from negative observations. Missing
-logical values remain missing, the categorical `unknown` state remains visible,
-and no imputation or weighting is applied. Because endpoint failures may be
-systematic, results for resolved observations should not be generalized to
-unresolved domains.
+## `/llms.txt` is not permission
 
-```{r}
-#| label: scan-quality
-
-scan_quality |>
-  transmute(
-    `Scan status` = tools::toTitleCase(as.character(.data$scan_status)),
-    Count = .data$count,
-    Proportion = .data$proportion
-  ) |>
-  gt() |>
-  fmt_integer(columns = "Count") |>
-  fmt_percent(columns = "Proportion", decimals = 1) |>
-  tab_options(table.font.names = "sans")
-```
-
-Endpoint classifications are retained separately because a partial scan can
-still produce a usable result for one endpoint.
-
-```{r}
-#| label: endpoint-statuses
-
-endpoint_statuses |>
-  arrange(.data$endpoint, desc(.data$count)) |>
-  mutate(
-    endpoint = if_else(
-      .data$endpoint == "llms.txt",
-      "/llms.txt",
-      "/robots.txt"
-    ),
-    status = gsub("_", " ", .data$status)
-  ) |>
-  select(
-    Endpoint = endpoint,
-    Status = status,
-    Count = count,
-    Proportion = proportion
-  ) |>
-  gt(groupname_col = "Endpoint") |>
-  fmt_integer(columns = "Count") |>
-  fmt_percent(columns = "Proportion", decimals = 1) |>
-  tab_options(table.font.names = "sans")
-```
-
-## Observed `/llms.txt` presence
-
-Observed presence means the collector found a plausible public `/llms.txt`
-file. It does not assess semantic quality, usefulness, or whether any AI
-provider uses the file.
-
-```{r}
-#| label: llms-presence-by-rank
-
-llms_rank_plot
-```
-
-## Declared `robots.txt` policies for tracked agents
-
-The analysis separates training/control tokens, AI search/indexing agents, and
-user-triggered fetch agents. `None`, `Some`, and `All` summarize how many
-tracked agents or tokens in a purpose group have partial or full restrictions.
-`Unknown` identifies unresolved policy observations; it is not counted as
-unrestricted.
-
-```{r}
-#| label: restrictions-by-purpose
-
-group_restriction_plot
-```
-
-At agent grain, `r most_restricted_agent_phrase` the largest observed
-restriction proportion: `r most_restricted_agent_pct` among
-`r most_restricted_agent_n` domains with a resolved policy for that token. This
-describes published rules in the resolved subset, not whether the named agent
-obeyed them.
-
-```{r}
-#| label: restrictions-by-agent
-#| fig-height: 9
-
-agent_restriction_plot
-```
-
-## Content Signals
-
-`Content-Signal` declarations are separate from crawler access rules. `Yes`
-and `No` are explicit preferences, `Unspecified` means no applicable site-wide
-declaration was found in an otherwise interpretable robots observation,
-`Invalid` preserves malformed or conflicting declarations, and `Unknown`
-marks observations that could not be evaluated reliably. The figure uses all
-selected domains as its denominator so that unresolved coverage remains visible.
-
-```{r}
-#| label: content-signals
-
-content_signal_plot
-```
-
-## Observed `/llms.txt` and restriction signals
-
-Publishing `/llms.txt` and declaring a restriction for a tracked agent are
-separate choices. The following descriptive cross-tabulation includes only
-domains for which both signals were resolved; proportions are calculated within
-each `/llms.txt` row. It is not an estimate of association across all selected
-domains.
+Among domains where both endpoints resolved,
+`r percent(llms_overlap$proportion, accuracy = 0.1)` with a plausible
+`/llms.txt` also had a partial or full `robots.txt` restriction applicable to
+at least one tracked agent (`r comma(llms_overlap$count)` of
+`r comma(llms_overlap$denominator)`).
 
 ```{r}
 #| label: discovery-restriction-overlap
+#| echo: false
+#| fig-alt: "A two-by-two heatmap comparing applicable tracked-agent restrictions for resolved domains with and without an llms.txt file."
 
 overlap_plot
 ```
 
-## Methodology
+This is a resolved-subset comparison, not evidence of association across all
+`r comma(nrow(domains))` domains.
 
-We scanned the top 100,000 pay-level domains from the standard Tranco list for
-publicly observable AI-related signals in `robots.txt` and `llms.txt`. The
-current inventory uses Tranco list `r list_id`.^[Available at
-[`r list_url`](`r list_url`).] `r generation_note` The list was retrieved on
-`r retrieved_on`, and the scan was run on 16 August 2026. When
-`data/input/tranco-metadata.json` is present, the report uses that file as the
-primary source for list provenance and supplies the verified 645ZX generation
-date when the metadata field is null.
+## Most restrictions are inherited
 
-For each domain, the collector requested only `/llms.txt` and `/robots.txt`.
-The domain-level dataset contains endpoint classifications, three site-wide
-Content Signal results, explicit-policy and any-restriction flags, and grouped
-restriction states. The agent-level dataset contains one row for each of 15
-tracked agents per domain. Partial and full restrictions both count as
-restrictive in proportion calculations, while full blocks remain available
-separately in the exported agent table.
+Only `r percent(explicit_policy$proportion, accuracy = 0.1)` of resolved domains
+explicitly addressed at least one tracked AI token. Most applicable
+restrictions instead came from general `User-agent: *` rules.
 
-Tranco rank is an aggregate rank over pay-level domains. It should not be read
-as traffic volume, exact visitors, page views, or HTTP reachability. Analysis
-denominators distinguish all selected domains, resolved endpoint observations,
-and determined AI-policy results. Failed network observations are not negative
-AI-policy observations.
+```{r}
+#| label: restriction-rule-source
+#| echo: false
+#| fig-alt: "Bar chart comparing restrictive domain-agent observations inherited from wildcard rules with explicit agent rules."
 
-This is a descriptive census attempt for the selected Tranco list, not a random
-sample of the web. The analysis reports counts and proportions without
-inferential tests, confidence intervals, weighting, or missing-value imputation.
-Rank-band comparisons are conditional on successful endpoint resolution within
-each band.
+restriction_source_plot
+```
 
-The render writes reproducible summary CSVs to `results/tables/` and PNG figures
-to `results/figures/`. The exact field definitions, tracked-agent list, and
-collection limitations are documented in the repository README.
+“Applicable” does not mean explicitly targeted. “Restricted” includes partial
+path restrictions as well as full blocks.
 
-## Limitations
+## Content Signals remain rare
 
-- `robots.txt` and Content Signals express declared policy or preference; they
-  do not prove enforcement, compliance, or legal permission.
-- User-agent strings can be spoofed, and user-triggered agents may behave
-  differently from autonomous crawlers.
-- `/llms.txt` is classified for plausible presence, not semantic quality.
-- Partial restrictions do not imply that every path is blocked.
-- Endpoint resolution is low and may be non-random. Resolved-subset proportions
-  should not be interpreted as prevalence estimates for all selected domains.
-- The population includes infrastructure and machine-facing domains as well as
-  consumer-facing sites, so this report consistently refers to domains rather
-  than websites.
-- Results are a time-bound snapshot of live, mutable resources.
+Content Signals express preferences, not access rules, and were rarely
+specified when `robots.txt` could be interpreted.
+
+```{r}
+#| label: content-signals
+#| echo: false
+#| fig-alt: "Grouped bars comparing explicit yes and no Content Signal declarations across search, AI input, and AI training."
+
+content_signals_plot
+```
+
+## Coverage
+
+```{r}
+#| label: coverage-table
+#| echo: false
+
+tibble::tibble(
+  Observation = c("Both endpoints", "/llms.txt", "Tracked-agent policy"),
+  Resolved = c(
+    complete_scan$numerator,
+    resolved_llms$numerator,
+    resolved_policy$numerator
+  ),
+  Share = c(
+    complete_scan$proportion,
+    resolved_llms$proportion,
+    resolved_policy$proportion
+  )
+) |>
+  gt() |>
+  fmt_integer(columns = "Resolved") |>
+  fmt_percent(columns = "Share", decimals = 1) |>
+  cols_label(Share = paste0("Share of ", comma(nrow(domains)))) |>
+  cols_align(align = "left", columns = "Observation") |>
+  tab_source_note(
+    "Endpoint failures may be systematic; resolved results are not estimates for unresolved domains."
+  ) |>
+  tab_options(
+    table.font.names = "sans",
+    table.font.size = px(15),
+    data_row.padding = px(6)
+  )
+```
+
+Unresolved observations remain unknown. They are never recoded as absent,
+allowed, or unrestricted.
+
+## Method
+
+The collector requested only `/llms.txt` and `/robots.txt` for the top
+`r comma(nrow(domains))` pay-level domains in
+[Tranco list 645ZX](https://tranco-list.eu/list/645ZX). The scan ran on
+16 August 2026.
+
+Rules cover training/control, AI search, and user-triggered fetch agents.
+Results are descriptive counts and proportions with no weighting, imputation,
+or inferential tests. Rendering writes CSVs and PNGs to `results/`.
+
+## Limits
+
+- Published signals do not prove enforcement, compliance, or permission.
+- Wildcard and explicit rules are distinguished; partial rules are not full
+  blocks.
+- `/llms.txt` presence does not measure semantic quality.
+- Endpoint resolution was low and may be non-random.
+- This is a time-bound scan of domains, not a random sample of websites.
 
 ## Citation
 
 Victor Le Pochat, Tom Van Goethem, Samaneh Tajalizadehkhoob, Maciej
-Korczyński, and Wouter Joosen. 2019. "Tranco: A Research-Oriented Top Sites
-Ranking Hardened Against Manipulation," *Proceedings of the 26th Annual Network
+Korczyński, and Wouter Joosen. 2019. “Tranco: A Research-Oriented Top Sites
+Ranking Hardened Against Manipulation,” *Proceedings of the 26th Annual Network
 and Distributed System Security Symposium (NDSS 2019).*
 <https://doi.org/10.14722/ndss.2019.23386>
