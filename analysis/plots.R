@@ -43,128 +43,101 @@ plot_theme <- theme_minimal(base_size = 12, base_family = "sans") +
     axis.text = element_text(color = ink)
   )
 
-llms_result <- key_metrics |>
-  filter(metric == "Observed /llms.txt among resolved observations")
+overall_llms_rate <- key_metrics |>
+  filter(metric == "Observed /llms.txt among resolved observations") |>
+  pull(proportion)
+overall_restriction_rate <- mean(domains$any_ai_bot_restricted, na.rm = TRUE)
 
-llms_presence_data <- tibble::tibble(
-  status = c("Observed", "Not observed"),
-  count = c(
-    llms_result$numerator,
-    llms_result$denominator - llms_result$numerator
-  )
+category_order <- category_plot_data |>
+  arrange(observed_llms_txt_share) |>
+  pull(category)
+
+category_comparison_data <- bind_rows(
+  category_plot_data |>
+    transmute(
+      category,
+      signal = "/llms.txt present",
+      value = observed_llms_txt_share
+    ),
+  category_plot_data |>
+    transmute(
+      category,
+      signal = "Tracked-agent restriction",
+      value = any_agent_restriction_share
+    )
 ) |>
   mutate(
-    proportion = count / llms_result$denominator,
-    xmax = cumsum(proportion),
-    xmin = lag(xmax, default = 0),
-    xmid = (xmin + xmax) / 2,
-    label = paste0(
-      status,
-      "\n",
-      percent(proportion, accuracy = 0.1),
-      "  |  ",
-      comma(count)
+    signal = factor(
+      signal,
+      levels = c("/llms.txt present", "Tracked-agent restriction")
     ),
-    label_color = if_else(status == "Observed", "white", ink)
+    category = factor(category, levels = category_order),
+    label = percent(value, accuracy = 0.1)
   )
 
-llms_presence_plot <- ggplot(llms_presence_data) +
-  geom_rect(
-    aes(xmin = xmin, xmax = xmax, ymin = 0.72, ymax = 1.28, fill = status)
+category_reference_data <- tibble::tibble(
+  signal = factor(
+    c("/llms.txt present", "Tracked-agent restriction"),
+    levels = levels(category_comparison_data$signal)
+  ),
+  value = c(overall_llms_rate, overall_restriction_rate)
+)
+
+category_comparison_plot <- ggplot(
+  category_comparison_data,
+  aes(x = value, y = category, color = signal)
+) +
+  geom_vline(
+    data = category_reference_data,
+    aes(xintercept = value),
+    color = muted_ink,
+    linewidth = 0.6,
+    linetype = "22",
+    inherit.aes = FALSE
   ) +
-  geom_text(
-    aes(x = xmid, y = 1, label = label, color = label_color),
-    fontface = "bold",
-    lineheight = 0.95,
-    size = 3.8
+  geom_segment(
+    aes(x = 0, xend = value, yend = category),
+    color = light_fill,
+    linewidth = 1
   ) +
-  scale_color_identity() +
-  scale_fill_manual(values = c("Observed" = signal_blue, "Not observed" = light_fill)) +
+  geom_point(size = 3.2) +
+  geom_label(
+    aes(label = label),
+    hjust = -0.1,
+    size = 2.9,
+    color = ink,
+    fill = "white",
+    label.size = 0,
+    label.padding = grid::unit(0.03, "lines")
+  ) +
+  facet_grid(. ~ signal, scales = "free_x") +
+  scale_color_manual(values = c(
+    "/llms.txt present" = signal_blue,
+    "Tracked-agent restriction" = restriction_red
+  )) +
   scale_x_continuous(
     labels = percent_format(accuracy = 1),
-    limits = c(0, 1),
-    breaks = seq(0, 1, 0.25),
-    expand = expansion(mult = c(0, 0))
+    expand = expansion(mult = c(0, 0.28))
   ) +
-  scale_y_continuous(limits = c(0.58, 1.42), expand = expansion(mult = 0)) +
   labs(
-    title = "Only one in eight resolved domains published /llms.txt",
-    subtitle = paste(comma(llms_result$denominator), "resolved /llms.txt checks"),
-    x = NULL,
+    title = "Categories signal discovery and restriction differently",
+    subtitle = "Ten categories, ordered by /llms.txt rate",
+    x = "Share of resolved observations",
     y = NULL,
-    caption = paste(
-      "Plausible presence only; semantic quality and provider use",
-      "were not assessed."
+    caption = paste0(
+      "ChatGPT-assigned categories with at least ",
+      comma(category_min_resolved),
+      " resolved checks for both signals; Other / Unknown omitted.",
+      "\nDashed lines show all-domain rates."
     )
   ) +
   plot_theme +
   theme(
-    axis.text.y = element_blank(),
-    axis.ticks.y = element_blank(),
-    panel.grid.major.y = element_blank(),
-    legend.position = "none"
+    legend.position = "none",
+    panel.spacing.x = grid::unit(2.5, "lines"),
+    strip.text = element_text(face = "bold", color = ink, size = 11),
+    strip.background = element_rect(fill = "#F4F6F8", color = NA)
   )
-
-overall_llms_rate <- llms_result$proportion
-overall_restriction_rate <- mean(domains$any_ai_bot_restricted, na.rm = TRUE)
-
-category_caption <- paste0(
-  "ChatGPT-assigned categories with at least ",
-  comma(category_min_resolved),
-  " resolved observations for both signals; Other / Unknown omitted.",
-  "\nThe dashed line is the all-domain resolved rate."
-)
-
-category_llms_data <- category_plot_data |>
-  mutate(
-    label = paste0(
-      percent(observed_llms_txt_share, accuracy = 0.1),
-      "  ",
-      comma(observed_llms_txt),
-      "/",
-      comma(resolved_llms_txt)
-    ),
-    category_order = reorder(category, observed_llms_txt_share)
-  )
-
-category_llms_plot <- ggplot(
-  category_llms_data,
-  aes(x = observed_llms_txt_share, y = category_order)
-) +
-  geom_vline(
-    xintercept = overall_llms_rate,
-    color = muted_ink,
-    linewidth = 0.6,
-    linetype = "22"
-  ) +
-  geom_segment(
-    aes(x = 0, xend = observed_llms_txt_share, yend = category_order),
-    color = light_fill,
-    linewidth = 1.1
-  ) +
-  geom_point(color = signal_blue, size = 3.5) +
-  geom_label(
-    aes(label = label),
-    hjust = -0.12,
-    size = 3.2,
-    color = ink,
-    fill = "white",
-    label.size = 0,
-    label.padding = grid::unit(0.04, "lines")
-  ) +
-  scale_x_continuous(
-    labels = percent_format(accuracy = 1),
-    limits = c(0, max(category_llms_data$observed_llms_txt_share) * 1.38),
-    expand = expansion(mult = c(0, 0))
-  ) +
-  labs(
-    title = "Software and finance lead /llms.txt adoption",
-    subtitle = "Plausible files among resolved /llms.txt checks, by domain category",
-    x = "Share with /llms.txt",
-    y = NULL,
-    caption = category_caption
-  ) +
-  plot_theme
 
 overlap_plot_data <- overlap_summary |>
   filter(restriction == "Any tracked-agent restriction") |>
@@ -218,125 +191,12 @@ overlap_plot <- ggplot(overlap_plot_data, aes(y = llms_txt)) +
     x = "Share with any partial or full tracked-agent restriction",
     y = NULL,
     caption = paste(
-      "Rules may be explicit or inherited from User-agent: *.",
-      "This does not measure permission, compliance, or enforcement."
+      "Partial and full rules; explicit or inherited.",
+      "Signals do not establish permission or enforcement."
     )
   ) +
   plot_theme +
   theme(legend.position = "none")
-
-category_restriction_data <- category_plot_data |>
-  mutate(
-    label = paste0(
-      percent(any_agent_restriction_share, accuracy = 0.1),
-      "  ",
-      comma(any_agent_restriction),
-      "/",
-      comma(resolved_agent_policy)
-    ),
-    label_hjust = if_else(any_agent_restriction_share > 0.82, 1.14, -0.12),
-    category_order = reorder(category, any_agent_restriction_share)
-  )
-
-category_restriction_plot <- ggplot(
-  category_restriction_data,
-  aes(x = any_agent_restriction_share, y = category_order)
-) +
-  geom_vline(
-    xintercept = overall_restriction_rate,
-    color = muted_ink,
-    linewidth = 0.6,
-    linetype = "22"
-  ) +
-  geom_segment(
-    aes(x = 0, xend = any_agent_restriction_share, yend = category_order),
-    color = light_fill,
-    linewidth = 1.1
-  ) +
-  geom_point(color = restriction_red, size = 3.5) +
-  geom_label(
-    aes(label = label, hjust = label_hjust),
-    size = 3.2,
-    color = ink,
-    fill = "white",
-    label.size = 0,
-    label.padding = grid::unit(0.04, "lines")
-  ) +
-  scale_x_continuous(
-    labels = percent_format(accuracy = 1),
-    limits = c(0, 1),
-    breaks = seq(0, 1, 0.25),
-    expand = expansion(mult = c(0, 0))
-  ) +
-  labs(
-    title = "Publishing and retail most often restrict tracked agents",
-    subtitle = "Any applicable partial or full robots.txt restriction, by domain category",
-    x = "Share with a tracked-agent restriction",
-    y = NULL,
-    caption = category_caption
-  ) +
-  plot_theme
-
-restriction_source_data <- restriction_source_summary |>
-  mutate(
-    source = factor(source, levels = c("Wildcard rule", "Explicit agent rule"))
-  ) |>
-  arrange(source) |>
-  mutate(
-    xmax = cumsum(proportion),
-    xmin = lag(xmax, default = 0),
-    xmid = (xmin + xmax) / 2,
-    label = paste0(
-      if_else(source == "Wildcard rule", "Wildcard rule", "Explicit rule"),
-      "\n",
-      percent(proportion, accuracy = 0.1),
-      "\n",
-      comma(count)
-    ),
-    label_color = if_else(source == "Wildcard rule", "white", ink)
-  )
-
-restriction_source_plot <- ggplot(restriction_source_data) +
-  geom_rect(
-    aes(xmin = xmin, xmax = xmax, ymin = 0.72, ymax = 1.28, fill = source)
-  ) +
-  geom_text(
-    aes(x = xmid, y = 1, label = label, color = label_color),
-    fontface = "bold",
-    lineheight = 0.95,
-    size = 3.25
-  ) +
-  scale_color_identity() +
-  scale_fill_manual(
-    values = c("Wildcard rule" = restriction_red, "Explicit agent rule" = light_fill)
-  ) +
-  scale_x_continuous(
-    labels = percent_format(accuracy = 1),
-    limits = c(0, 1),
-    breaks = seq(0, 1, 0.25),
-    expand = expansion(mult = c(0, 0))
-  ) +
-  scale_y_continuous(limits = c(0.58, 1.42), expand = expansion(mult = 0)) +
-  labs(
-    title = "Nine in ten applicable restrictions are inherited",
-    subtitle = paste0(
-      comma(unique(restriction_source_data$denominator)),
-      " restrictive domain-agent observations"
-    ),
-    x = NULL,
-    y = NULL,
-    caption = paste(
-      "Wildcard rules are inherited from User-agent: *;",
-      "partial and full restrictions are included."
-    )
-  ) +
-  plot_theme +
-  theme(
-    axis.text.y = element_blank(),
-    axis.ticks.y = element_blank(),
-    panel.grid.major.y = element_blank(),
-    legend.position = "none"
-  )
 
 content_plot_data <- content_summary |>
   filter(signal %in% c("Yes", "No")) |>
@@ -368,7 +228,7 @@ content_signals_plot <- ggplot(
     expand = expansion(mult = c(0, 0))
   ) +
   labs(
-    title = "Content Signals are nearly absent, with one exception",
+    title = "Content Signals are nearly absent except for training refusals",
     subtitle = paste0(
       percent(unspecified_range[[1]], accuracy = 0.1),
       " to ",
@@ -379,8 +239,8 @@ content_signals_plot <- ggplot(
     y = NULL,
     color = "Declared preference",
     caption = paste(
-      "AI-training refusals reached 5.7%; every other explicit",
-      "yes/no declaration remained below 1%. Site-wide declarations only."
+      "Site-wide declarations. AI-training 'No' reached 5.7%;",
+      "all other explicit responses stayed below 1%."
     )
   ) +
   plot_theme
