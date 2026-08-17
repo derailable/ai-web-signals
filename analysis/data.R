@@ -1,20 +1,20 @@
-library(readr)
+# Data contracts and explicit loaders for the processed analysis datasets.
 
-domain_col_types <- cols(
-  rank = col_integer(),
-  domain = col_character(),
-  has_llms_txt = col_logical(),
-  llms_txt_status = col_character(),
-  robots_txt_status = col_character(),
-  content_signal_search = col_character(),
-  content_signal_ai_input = col_character(),
-  content_signal_ai_train = col_character(),
-  has_explicit_ai_policy = col_logical(),
-  any_ai_bot_restricted = col_logical(),
-  training_bots_restricted = col_character(),
-  search_bots_restricted = col_character(),
-  user_fetch_bots_restricted = col_character(),
-  scan_status = col_character()
+domain_col_types <- readr::cols(
+  rank = readr::col_integer(),
+  domain = readr::col_character(),
+  has_llms_txt = readr::col_logical(),
+  llms_txt_status = readr::col_character(),
+  robots_txt_status = readr::col_character(),
+  content_signal_search = readr::col_character(),
+  content_signal_ai_input = readr::col_character(),
+  content_signal_ai_train = readr::col_character(),
+  has_explicit_ai_policy = readr::col_logical(),
+  any_ai_bot_restricted = readr::col_logical(),
+  training_bots_restricted = readr::col_character(),
+  search_bots_restricted = readr::col_character(),
+  user_fetch_bots_restricted = readr::col_character(),
+  scan_status = readr::col_character()
 )
 
 domain_columns <- c(
@@ -105,12 +105,12 @@ agent_purpose_groups <- c(
   `MistralAI-User` = "user_fetch"
 )
 
-agent_policy_col_types <- cols(
-  rank = col_integer(),
-  domain = col_character(),
-  agent = col_character(),
-  purpose_group = col_character(),
-  policy = col_character()
+agent_policy_col_types <- readr::cols(
+  rank = readr::col_integer(),
+  domain = readr::col_character(),
+  agent = readr::col_character(),
+  purpose_group = readr::col_character(),
+  policy = readr::col_character()
 )
 
 agent_policy_columns <- c(
@@ -142,7 +142,7 @@ removed_policy_columns <- c(
 validate_domains <- function(domains, expected_count = 100000) {
   stopifnot(identical(names(domains), domain_columns))
   stopifnot(nrow(domains) == expected_count)
-  stopifnot(nrow(problems(domains)) == 0)
+  stopifnot(nrow(readr::problems(domains)) == 0)
   stopifnot(!any(vapply(domains, is.list, logical(1))))
   stopifnot(identical(domains$rank, seq_len(expected_count)))
   stopifnot(!anyDuplicated(domains$rank))
@@ -167,11 +167,11 @@ load_domains <- function(
   path = "data/processed/domains.csv",
   expected_count = 100000
 ) {
-  domains <- read_csv(
+  domains <- readr::read_csv(
     path,
     col_types = domain_col_types,
     na = "",
-    locale = locale(encoding = "UTF-8"),
+    locale = readr::locale(encoding = "UTF-8"),
     name_repair = "check_unique",
     show_col_types = FALSE,
     progress = FALSE
@@ -187,7 +187,7 @@ validate_agent_policies <- function(agent_policies, domains) {
 
   stopifnot(identical(names(agent_policies), agent_policy_columns))
   stopifnot(nrow(agent_policies) == expected_count)
-  stopifnot(nrow(problems(agent_policies)) == 0)
+  stopifnot(nrow(readr::problems(agent_policies)) == 0)
   stopifnot(!any(vapply(agent_policies, is.list, logical(1))))
   stopifnot(identical(
     agent_policies$rank,
@@ -208,14 +208,14 @@ validate_agent_policies <- function(agent_policies, domains) {
 }
 
 load_agent_policies <- function(
-  path = "data/processed/agent-policies.csv",
-  domains = load_domains()
+  domains,
+  path = "data/processed/agent-policies.csv"
 ) {
-  agent_policies <- read_csv(
+  agent_policies <- readr::read_csv(
     path,
     col_types = agent_policy_col_types,
     na = "",
-    locale = locale(encoding = "UTF-8"),
+    locale = readr::locale(encoding = "UTF-8"),
     name_repair = "check_unique",
     show_col_types = FALSE,
     progress = FALSE
@@ -230,6 +230,3 @@ load_tranco_metadata <- function(path = "data/input/tranco-metadata.json") {
   }
   jsonlite::fromJSON(path)
 }
-
-domains <- load_domains()
-tranco_metadata <- load_tranco_metadata()
