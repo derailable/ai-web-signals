@@ -139,27 +139,158 @@ removed_policy_columns <- c(
   "mistral_ai_user_policy"
 )
 
+abort_validation <- function(dataset, details) {
+  cli::cli_abort(c(
+    "Can't validate `{dataset}`.",
+    "x" = details
+  ))
+}
+
+assert_valid <- function(condition, dataset, details) {
+  if (!isTRUE(condition)) {
+    abort_validation(dataset, details)
+  }
+  invisible(TRUE)
+}
+
+assert_allowed_values <- function(values, allowed, dataset, column) {
+  invalid <- unique(values[!(values %in% allowed)])
+  invalid <- ifelse(is.na(invalid), "NA", as.character(invalid))
+
+  assert_valid(
+    length(invalid) == 0,
+    dataset,
+    paste0(
+      "Column `", column, "` contains unsupported value(s): ",
+      toString(invalid), "."
+    )
+  )
+}
+
 validate_domains <- function(domains, expected_count = 100000) {
-  stopifnot(identical(names(domains), domain_columns))
-  stopifnot(nrow(domains) == expected_count)
-  stopifnot(nrow(readr::problems(domains)) == 0)
-  stopifnot(!any(vapply(domains, is.list, logical(1))))
-  stopifnot(identical(domains$rank, seq_len(expected_count)))
-  stopifnot(!anyDuplicated(domains$rank))
-  stopifnot(!anyDuplicated(domains$domain))
-  stopifnot(!any(removed_policy_columns %in% names(domains)))
-  stopifnot(all(domains$llms_txt_status %in% llms_statuses))
-  stopifnot(all(domains$robots_txt_status %in% robots_statuses))
-  stopifnot(all(domains$content_signal_search %in% content_signal_states))
-  stopifnot(all(domains$content_signal_ai_input %in% content_signal_states))
-  stopifnot(all(domains$content_signal_ai_train %in% content_signal_states))
-  stopifnot(all(domains$scan_status %in% scan_states))
-  stopifnot(all(domains$training_bots_restricted %in% restricted_states))
-  stopifnot(all(domains$search_bots_restricted %in% restricted_states))
-  stopifnot(all(domains$user_fetch_bots_restricted %in% restricted_states))
-  stopifnot(is.logical(domains$has_llms_txt))
-  stopifnot(is.logical(domains$has_explicit_ai_policy))
-  stopifnot(is.logical(domains$any_ai_bot_restricted))
+  dataset <- "domains.csv"
+  parse_problem_count <- nrow(readr::problems(domains))
+
+  assert_valid(
+    identical(names(domains), domain_columns),
+    dataset,
+    paste0(
+      "Columns must match this schema and order: ",
+      toString(domain_columns), "."
+    )
+  )
+  assert_valid(
+    nrow(domains) == expected_count,
+    dataset,
+    paste0(
+      "Expected ", expected_count, " rows, found ", nrow(domains), "."
+    )
+  )
+  assert_valid(
+    parse_problem_count == 0,
+    dataset,
+    paste0("CSV parsing produced ", parse_problem_count, " problem(s).")
+  )
+  assert_valid(
+    !any(vapply(domains, is.list, logical(1))),
+    dataset,
+    "Columns must be atomic vectors; list columns are not allowed."
+  )
+  assert_valid(
+    identical(domains$rank, seq_len(expected_count)),
+    dataset,
+    paste0(
+      "Column `rank` must contain every integer from 1 to ",
+      expected_count,
+      " in order."
+    )
+  )
+  assert_valid(
+    !anyDuplicated(domains$rank),
+    dataset,
+    "Column `rank` must not contain duplicates."
+  )
+  assert_valid(
+    !anyDuplicated(domains$domain),
+    dataset,
+    "Column `domain` must not contain duplicates."
+  )
+  assert_valid(
+    !any(removed_policy_columns %in% names(domains)),
+    dataset,
+    "Legacy per-agent policy columns must not be present."
+  )
+
+  assert_allowed_values(
+    domains$llms_txt_status,
+    llms_statuses,
+    dataset,
+    "llms_txt_status"
+  )
+  assert_allowed_values(
+    domains$robots_txt_status,
+    robots_statuses,
+    dataset,
+    "robots_txt_status"
+  )
+  assert_allowed_values(
+    domains$content_signal_search,
+    content_signal_states,
+    dataset,
+    "content_signal_search"
+  )
+  assert_allowed_values(
+    domains$content_signal_ai_input,
+    content_signal_states,
+    dataset,
+    "content_signal_ai_input"
+  )
+  assert_allowed_values(
+    domains$content_signal_ai_train,
+    content_signal_states,
+    dataset,
+    "content_signal_ai_train"
+  )
+  assert_allowed_values(
+    domains$scan_status,
+    scan_states,
+    dataset,
+    "scan_status"
+  )
+  assert_allowed_values(
+    domains$training_bots_restricted,
+    restricted_states,
+    dataset,
+    "training_bots_restricted"
+  )
+  assert_allowed_values(
+    domains$search_bots_restricted,
+    restricted_states,
+    dataset,
+    "search_bots_restricted"
+  )
+  assert_allowed_values(
+    domains$user_fetch_bots_restricted,
+    restricted_states,
+    dataset,
+    "user_fetch_bots_restricted"
+  )
+
+  assert_valid(
+    is.logical(domains$has_llms_txt),
+    dataset,
+    "Column `has_llms_txt` must be logical."
+  )
+  assert_valid(
+    is.logical(domains$has_explicit_ai_policy),
+    dataset,
+    "Column `has_explicit_ai_policy` must be logical."
+  )
+  assert_valid(
+    is.logical(domains$any_ai_bot_restricted),
+    dataset,
+    "Column `any_ai_bot_restricted` must be logical."
+  )
   invisible(domains)
 }
 
@@ -181,29 +312,78 @@ load_domains <- function(
 }
 
 validate_agent_policies <- function(agent_policies, domains) {
+  dataset <- "agent-policies.csv"
   agents_per_domain <- length(tracked_agents)
   expected_count <- nrow(domains) * agents_per_domain
   expected_agents <- rep(tracked_agents, times = nrow(domains))
+  parse_problem_count <- nrow(readr::problems(agent_policies))
 
-  stopifnot(identical(names(agent_policies), agent_policy_columns))
-  stopifnot(nrow(agent_policies) == expected_count)
-  stopifnot(nrow(readr::problems(agent_policies)) == 0)
-  stopifnot(!any(vapply(agent_policies, is.list, logical(1))))
-  stopifnot(identical(
-    agent_policies$rank,
-    rep(domains$rank, each = agents_per_domain)
-  ))
-  stopifnot(identical(
-    agent_policies$domain,
-    rep(domains$domain, each = agents_per_domain)
-  ))
-  stopifnot(identical(agent_policies$agent, expected_agents))
-  stopifnot(identical(
-    agent_policies$purpose_group,
-    unname(agent_purpose_groups[expected_agents])
-  ))
-  stopifnot(all(agent_policies$policy %in% policy_states))
-  stopifnot(!anyDuplicated(agent_policies[c("domain", "agent")]))
+  assert_valid(
+    identical(names(agent_policies), agent_policy_columns),
+    dataset,
+    paste0(
+      "Columns must match this schema and order: ",
+      toString(agent_policy_columns), "."
+    )
+  )
+  assert_valid(
+    nrow(agent_policies) == expected_count,
+    dataset,
+    paste0(
+      "Expected ", expected_count, " rows, found ",
+      nrow(agent_policies), "."
+    )
+  )
+  assert_valid(
+    parse_problem_count == 0,
+    dataset,
+    paste0("CSV parsing produced ", parse_problem_count, " problem(s).")
+  )
+  assert_valid(
+    !any(vapply(agent_policies, is.list, logical(1))),
+    dataset,
+    "Columns must be atomic vectors; list columns are not allowed."
+  )
+  assert_valid(
+    identical(
+      agent_policies$rank,
+      rep(domains$rank, each = agents_per_domain)
+    ),
+    dataset,
+    "Column `rank` must repeat each domain rank in canonical agent order."
+  )
+  assert_valid(
+    identical(
+      agent_policies$domain,
+      rep(domains$domain, each = agents_per_domain)
+    ),
+    dataset,
+    "Column `domain` must repeat each domain in canonical agent order."
+  )
+  assert_valid(
+    identical(agent_policies$agent, expected_agents),
+    dataset,
+    "Column `agent` must follow the canonical tracked-agent order."
+  )
+  assert_valid(
+    identical(
+      agent_policies$purpose_group,
+      unname(agent_purpose_groups[expected_agents])
+    ),
+    dataset,
+    "Column `purpose_group` must match each tracked agent."
+  )
+  assert_allowed_values(
+    agent_policies$policy,
+    policy_states,
+    dataset,
+    "policy"
+  )
+  assert_valid(
+    !anyDuplicated(agent_policies[c("domain", "agent")]),
+    dataset,
+    "Each `domain` and `agent` pair must be unique."
+  )
   invisible(agent_policies)
 }
 
