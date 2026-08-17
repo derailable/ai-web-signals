@@ -52,23 +52,15 @@ write_csv(
 )
 
 ggsave(
-  "results/figures/01-llms-presence.png",
-  llms_presence_plot,
-  width = 10,
-  height = 4,
-  dpi = 320,
-  bg = "white"
-)
-ggsave(
-  "results/figures/02-category-llms-presence.png",
-  category_llms_plot,
+  "results/figures/01-category-comparison.png",
+  category_comparison_plot,
   width = 10,
   height = 6.4,
   dpi = 320,
   bg = "white"
 )
 ggsave(
-  "results/figures/03-llms-restriction-overlap.png",
+  "results/figures/02-llms-restriction-overlap.png",
   overlap_plot,
   width = 10,
   height = 4.6,
@@ -76,23 +68,7 @@ ggsave(
   bg = "white"
 )
 ggsave(
-  "results/figures/04-category-agent-restrictions.png",
-  category_restriction_plot,
-  width = 10,
-  height = 6.4,
-  dpi = 320,
-  bg = "white"
-)
-ggsave(
-  "results/figures/05-restriction-rule-source.png",
-  restriction_source_plot,
-  width = 10,
-  height = 3.8,
-  dpi = 320,
-  bg = "white"
-)
-ggsave(
-  "results/figures/06-content-signals.png",
+  "results/figures/03-content-signals.png",
   content_signals_plot,
   width = 10,
   height = 5,
@@ -115,75 +91,27 @@ resolved_llms_metric <- key_metrics |>
 resolved_policy_metric <- key_metrics |>
   filter(metric == "Resolved tracked-agent policy observations")
 
-llms_overlap <- overlap_summary |>
-  filter(
-    llms_txt == "Present",
-    restriction == "Any tracked-agent restriction"
-  )
-
-category_llms_high <- category_plot_data |>
-  slice_max(observed_llms_txt_share, n = 1, with_ties = FALSE)
-
-category_llms_low <- category_plot_data |>
-  slice_min(observed_llms_txt_share, n = 1, with_ties = FALSE)
-
-category_restriction_high <- category_plot_data |>
-  slice_max(any_agent_restriction_share, n = 1, with_ties = FALSE)
-
-category_restriction_low <- category_plot_data |>
-  slice_min(any_agent_restriction_share, n = 1, with_ties = FALSE)
+wildcard_source_metric <- restriction_source_summary |>
+  filter(source == "Wildcard rule")
 ```
 
-AI discovery, crawler access, and content preferences are separate signals.
-They can appear together, conflict, or remain unspecified. None establishes
-permission, compliance, or legal status.
+## Categories differ
 
-## `/llms.txt` remains uncommon
-
-```{r}
-#| label: llms-presence
-#| echo: false
-#| fig-height: 4
-#| fig-alt: "A stacked bar comparing resolved domains with and without an observed llms.txt file."
-
-llms_presence_plot
-```
-
-A plausible file appeared on
-`r percent(observed_llms_metric$proportion, accuracy = 0.1)` of resolved
-observations (`r comma(observed_llms_metric$numerator)` of
+A plausible `/llms.txt` appeared on
+`r percent(observed_llms_metric$proportion, accuracy = 0.1)` of resolved checks
+(`r comma(observed_llms_metric$numerator)` of
 `r comma(observed_llms_metric$denominator)`).
 
-### Adoption varies by category
-
-Among categories with enough resolved observations to compare,
-`r category_llms_high$category` had the highest observed rate at
-`r percent(category_llms_high$observed_llms_txt_share, accuracy = 0.1)`
-(`r comma(category_llms_high$observed_llms_txt)` of
-`r comma(category_llms_high$resolved_llms_txt)`).
-`r category_llms_low$category` was lowest at
-`r percent(category_llms_low$observed_llms_txt_share, accuracy = 0.1)`.
-
 ```{r}
-#| label: category-llms-presence
+#| label: category-comparison
 #| echo: false
 #| fig-height: 6.4
-#| fig-alt: "A ranked dot plot showing llms.txt presence rates for ten domain categories with at least 90 resolved observations. Software and technology is highest and government and public sector is lowest."
+#| fig-alt: "Two aligned dot plots compare llms.txt presence and tracked-agent restrictions across ten adequately resolved domain categories. Software leads llms.txt presence, while news and retail lead restrictions."
 
-category_llms_plot
+category_comparison_plot
 ```
 
-These are exploratory ChatGPT-assigned categories, not a validated taxonomy.
-The comparison omits “Other / Unknown” and categories with fewer than
-`r comma(category_min_resolved)` resolved observations for either signal.
-
 ## `/llms.txt` is not permission
-
-Among domains where both endpoints resolved,
-`r percent(llms_overlap$proportion, accuracy = 0.1)` with a plausible
-`/llms.txt` also had a partial or full `robots.txt` restriction applicable to
-at least one tracked agent (`r comma(llms_overlap$count)` of
-`r comma(llms_overlap$denominator)`).
 
 ```{r}
 #| label: discovery-restriction-overlap
@@ -194,49 +122,13 @@ at least one tracked agent (`r comma(llms_overlap$count)` of
 overlap_plot
 ```
 
-This is a resolved-subset comparison, not evidence of association across all
-`r comma(nrow(domains))` domains.
+This resolved-subset comparison is descriptive, not evidence of association.
+`r percent(wildcard_source_metric$proportion, accuracy = 0.1)` of restrictive
+domain-agent observations came from `User-agent: *`; only
+`r percent(explicit_policy_metric$proportion, accuracy = 0.1)` of resolved
+domains explicitly addressed a tracked AI token.
 
-### Restrictions also vary by category
-
-`r category_restriction_high$category` had the highest restriction rate among
-the plotted categories at
-`r percent(category_restriction_high$any_agent_restriction_share, accuracy = 0.1)`;
-`r category_restriction_low$category` was lowest at
-`r percent(category_restriction_low$any_agent_restriction_share, accuracy = 0.1)`.
-The range is descriptive and may partly reflect which endpoints resolved.
-
-```{r}
-#| label: category-agent-restrictions
-#| echo: false
-#| fig-height: 6.4
-#| fig-alt: "A ranked dot plot of applicable tracked-agent restriction rates for ten domain categories. News and publishing and e-commerce and retail are highest; cloud infrastructure is lowest."
-
-category_restriction_plot
-```
-
-## Most restrictions are inherited
-
-Only `r percent(explicit_policy_metric$proportion, accuracy = 0.1)` of resolved
-domains explicitly addressed at least one tracked AI token. Most applicable
-restrictions instead came from general `User-agent: *` rules.
-
-```{r}
-#| label: restriction-rule-source
-#| echo: false
-#| fig-height: 3.8
-#| fig-alt: "A stacked bar shows that 90.5 percent of restrictive domain-agent observations came from wildcard rules and 9.5 percent from explicit agent rules."
-
-restriction_source_plot
-```
-
-“Applicable” does not mean explicitly targeted. “Restricted” includes partial
-path restrictions as well as full blocks.
-
-## Content Signals remain rare
-
-Content Signals express preferences, not access rules, and were rarely
-specified when `robots.txt` could be interpreted.
+## Content preferences are mostly unstated
 
 ```{r}
 #| label: content-signals
@@ -264,11 +156,6 @@ tibble::tibble(
     resolved_llms_metric$numerator,
     resolved_policy_metric$numerator
   ),
-  Unresolved = nrow(domains) - c(
-    complete_scan_metric$numerator,
-    resolved_llms_metric$numerator,
-    resolved_policy_metric$numerator
-  ),
   Coverage = c(
     complete_scan_metric$proportion,
     resolved_llms_metric$proportion,
@@ -277,18 +164,13 @@ tibble::tibble(
 ) |>
   gt() |>
   tab_header(
-    title = md("**Resolution is the study's main constraint**"),
-    subtitle = paste0(
-      "Resolved observations, not all ",
-      comma(nrow(domains)),
-      " selected domains, define outcome denominators."
-    )
+    title = md("**Only about one in ten endpoints resolved**")
   ) |>
-  fmt_integer(columns = c("Resolved", "Unresolved")) |>
+  fmt_integer(columns = "Resolved") |>
   fmt_percent(columns = "Coverage", decimals = 1) |>
-  cols_label(Coverage = paste0("Coverage of ", comma(nrow(domains)))) |>
+  cols_label(Coverage = paste0("Of ", comma(nrow(domains)))) |>
   cols_align(align = "left", columns = "Observation") |>
-  cols_align(align = "right", columns = c("Resolved", "Unresolved", "Coverage")) |>
+  cols_align(align = "right", columns = c("Resolved", "Coverage")) |>
   tab_style(
     style = cell_text(weight = "bold", color = "#2F6FA3"),
     locations = cells_body(columns = "Coverage")
@@ -307,31 +189,20 @@ tibble::tibble(
   )
 ```
 
-Unresolved observations remain unknown. They are never recoded as absent,
-allowed, or unrestricted.
+## Method and limits
 
-## Method
+The collector requested `/llms.txt` and `/robots.txt` for the 100,000 pay-level
+domains in [Tranco list 645ZX](https://tranco-list.eu/list/645ZX) on 16 August
+2026. Rules cover training/control, AI search, and user-triggered fetch agents.
 
-The collector requested only `/llms.txt` and `/robots.txt` for the top
-`r comma(nrow(domains))` pay-level domains in
-[Tranco list 645ZX](https://tranco-list.eu/list/645ZX). The scan ran on
-16 August 2026.
+- Results are descriptive; there is no weighting, imputation, or inference.
+- Unresolved observations remain unknown. Missingness may be systematic.
+- Partial restrictions are not full blocks; `/llms.txt` presence says nothing
+  about quality or use.
+- Categories are uneven and exploratory. Published signals do not prove
+  permission, compliance, or enforcement.
 
-Rules cover training/control, AI search, and user-triggered fetch agents.
-Results are descriptive counts and proportions with no weighting, imputation,
-or inferential tests. Category figures use the exploratory labels in
-`data/processed/categorized-domains.csv`. Rendering writes CSVs and PNGs to
-`results/`.
-
-## Limits
-
-- Published signals do not prove enforcement, compliance, or permission.
-- Wildcard and explicit rules are distinguished; partial rules are not full
-  blocks.
-- `/llms.txt` presence does not measure semantic quality.
-- Category labels are model-assigned, exploratory, and unevenly distributed.
-- Endpoint resolution was low and may be non-random.
-- This is a time-bound scan of domains, not a random sample of websites.
+Rendering writes CSVs and PNGs to `results/`.
 
 ## Citation
 
