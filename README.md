@@ -55,6 +55,19 @@ Tracked groups:
 - User-triggered fetch: ChatGPT-User, Claude-User, Perplexity-User,
   MistralAI-User
 
+### Domain categories
+
+`data/processed/categorized-domains.csv` contains exploratory ChatGPT-assigned
+categories for all 100,000 domains.
+
+```bash
+Rscript analysis/categories.R
+```
+
+The script validates and joins the categories, then writes coverage and signal
+rates to `results/tables/category-summary.csv`. Treat the labels as exploratory:
+85,039 domains are `Other / Unknown`, and some categories are small.
+
 ## Estimation and outputs
 
 All proportions are descriptive and use the denominator shown. Endpoint
