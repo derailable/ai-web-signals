@@ -31,12 +31,13 @@ references:
   - type: dataset
     authors:
       - name: "Tranco"
-    title: "Tranco Standard List PYGVJ"
-    url: "https://tranco-list.eu/list/PYGVJ"
-    date-accessed: "2026-07-30"
+    title: "Tranco Standard List 26J39"
+    url: "https://tranco-list.eu/list/26J39/1000000"
+    date-released: "2026-08-16"
+    date-accessed: "2026-08-16"
   - type: website
     authors:
       - name: "Tranco"
     title: "Tranco"
     url: "https://tranco-list.eu"
-    date-accessed: "2026-07-30"
+    date-accessed: "2026-08-16"
