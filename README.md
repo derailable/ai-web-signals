@@ -1,16 +1,16 @@
 # ai-web-signals
 
-`ai-web-signals` measures public AI-related signals across the Tranco Top
-100,000 pay-level domains:
+A reproducible descriptive scan of public AI-related signals across the Tranco
+Top 100,000 pay-level domains:
 
 - plausible `/llms.txt` presence;
-- `robots.txt` policy for documented AI-related agents and control tokens; and
+- `robots.txt` rules applicable to documented AI agents; and
 - site-wide `Content-Signal` preferences.
 
-These are published signals, not evidence of crawler compliance, provider
-behavior, legal permission, or internal AI adoption.
+These are published signals—not evidence of permission, compliance, provider
+behavior, or AI adoption.
 
-## Quick start
+## Run
 
 Requires Python 3.11+, [`uv`](https://docs.astral.sh/uv/), R, and
 [Quarto](https://quarto.org/).
@@ -23,38 +23,28 @@ uv run python collection/fetch.py
 quarto render
 ```
 
-The collector requests only `/llms.txt` and `/robots.txt`. It uses HTTPS first,
-bounded concurrency and response sizes, TLS verification, and screened redirect
-targets.
+The collector requests only `/llms.txt` and `/robots.txt`, using HTTPS first,
+bounded concurrency and response sizes, TLS verification, and screened
+redirects.
 
-## Data
+## Data model
 
-Generated data and rendered outputs are local-only and ignored by Git:
+The collector writes two tidy CSVs:
 
-```text
-data/input/
-data/processed/
-results/
-_site/
-```
+- `data/processed/domains.csv`: one observation per ranked domain;
+- `data/processed/agent-policies.csv`: one observation per domain-agent pair.
 
-The collector writes:
-
-- `data/processed/domains.csv`: one row per ranked domain;
-- `data/processed/agent-policies.csv`: one row per domain and tracked agent.
-
-Load and validate both datasets in R:
+Load them with fixed `readr` column types:
 
 ```r
 source("analysis/data.R")
-
-domains <- load_domains()
-agent_policies <- load_agent_policies(domains)
 ```
 
-Blank logical values and categorical `unknown` values mean unresolved, not
-`false` or unrestricted. Group restrictions use `none`, `some`, `all`, and
-`unknown`; partial and full restrictions both count as restrictive.
+Analysis uses `readr`, `dplyr`/`tidyr`, `ggplot2`, and `gt`. Blank logical
+values and `unknown` categories mean unresolved—not `false`, absent, allowed,
+or unrestricted. Group states are `none`, `some`, `all`, and `unknown`;
+partial and full rules both count as restrictive. Agent-level states preserve
+whether a rule was explicit or inherited from `User-agent: *`.
 
 Tracked groups:
 
@@ -65,32 +55,27 @@ Tracked groups:
 - User-triggered fetch: ChatGPT-User, Claude-User, Perplexity-User,
   MistralAI-User
 
-The rendered report writes summary tables to `results/tables/`, figures to
-`results/figures/`, and HTML to `_site/`.
+## Estimation and outputs
 
-## Interpretation
+All proportions are descriptive and use the denominator shown. Endpoint
+missingness may be non-random, so resolved-subset results are not prevalence
+estimates for all selected domains. The analysis applies no imputation,
+weighting, or inferential tests.
 
-The current inventory uses Tranco list 645ZX, generated on 15 August
-2026.[^list] The list was retrieved and the scan was run on 16 August 2026.
-Tranco rank is an aggregate rank, not traffic volume or HTTP reachability.
+Rendering writes CSV summaries to `results/tables/`, PNG figures to
+`results/figures/`, and HTML to `_site/`. Generated inputs and outputs under
+`data/input/`, `data/processed/`, `results/`, and `_site/` are ignored by Git.
 
-[^list]: Available at <https://tranco-list.eu/list/645ZX>.
-
-Analysis distinguishes all selected domains from resolved endpoint and policy
-observations. Unresolved observations are never recoded as negative results.
-Because endpoint failures may be non-random, resolved-subset proportions should
-not be generalized to all selected domains.
-
-`robots.txt` and Content Signals express declared policy or preference; they do
-not prove enforcement. `/llms.txt` is classified for plausible presence, not
-semantic quality. Results are a time-bound descriptive snapshot.
+The current snapshot uses [Tranco list 645ZX](https://tranco-list.eu/list/645ZX),
+generated 15 August 2026 and scanned 16 August 2026. Tranco rank is an aggregate
+rank—not traffic, audience size, or HTTP reachability.
 
 ## Citation
 
-Victor Le Pochat, Tom Van Goethem, Samaneh Tajalizadehkhoob, Maciej Korczyński,
-and Wouter Joosen. 2019. “Tranco: A Research-Oriented Top Sites Ranking Hardened
-Against Manipulation,” *Proceedings of the 26th Annual Network and Distributed
-System Security Symposium (NDSS 2019).* <https://doi.org/10.14722/ndss.2019.23386>
+Le Pochat, V., Van Goethem, T., Tajalizadehkhoob, S., Korczyński, M., and
+Joosen, W. (2019). “Tranco: A Research-Oriented Top Sites Ranking Hardened
+Against Manipulation.” *NDSS 2019.*
+<https://doi.org/10.14722/ndss.2019.23386>
 
-Tranco and its source providers are not affiliated with this project and do not
-endorse it. Project code is MIT licensed.
+Tranco and its source providers do not endorse this project. Code is MIT
+licensed.
