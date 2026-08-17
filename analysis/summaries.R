@@ -45,7 +45,12 @@ add_rank_bands <- function(domains) {
       rank_band = cut(
         .data$rank,
         breaks = c(0, 100, 1000, 10000, Inf),
-        labels = c("1–100", "101–1,000", "1,001–10,000", "10,001–100,000"),
+        labels = c(
+          "1–100",
+          "101–1,000",
+          "1,001–10,000",
+          "10,001–100,000"
+        ),
         right = TRUE
       )
     )
@@ -76,7 +81,7 @@ summarise_endpoint_statuses <- function(domains) {
       total_domains = nrow(domains),
       proportion = .data$count / .data$total_domains
     ) |>
-    select(.data$endpoint, .data$status, .data$count, .data$total_domains, .data$proportion)
+    select(endpoint, status, count, total_domains, proportion)
 }
 
 summarise_key_metrics <- function(domains) {
@@ -175,9 +180,9 @@ summarise_rank_bands <- function(domains) {
 summarise_group_restrictions <- function(domains) {
   domains |>
     select(
-      training = .data$training_bots_restricted,
-      search = .data$search_bots_restricted,
-      user_fetch = .data$user_fetch_bots_restricted
+      training = training_bots_restricted,
+      search = search_bots_restricted,
+      user_fetch = user_fetch_bots_restricted
     ) |>
     pivot_longer(
       cols = everything(),
@@ -217,7 +222,9 @@ summarise_agent_policies <- function(agent_policies) {
       total_domains = n(),
       resolved_results = sum(.data$policy != "unknown"),
       restricted = sum(.data$policy %in% restrictive_policy_states),
-      fully_blocked = sum(.data$policy %in% c("blocked_explicit", "blocked_wildcard")),
+      fully_blocked = sum(
+        .data$policy %in% c("blocked_explicit", "blocked_wildcard")
+      ),
       explicitly_addressed = sum(.data$policy %in% explicit_policy_states),
       unknown = sum(.data$policy == "unknown"),
       restriction_proportion = safe_proportion(
@@ -248,9 +255,9 @@ summarise_agent_policies <- function(agent_policies) {
 summarise_content_signals <- function(domains) {
   domains |>
     select(
-      search = .data$content_signal_search,
-      ai_input = .data$content_signal_ai_input,
-      ai_train = .data$content_signal_ai_train
+      search = content_signal_search,
+      ai_input = content_signal_ai_input,
+      ai_train = content_signal_ai_train
     ) |>
     pivot_longer(
       cols = everything(),
