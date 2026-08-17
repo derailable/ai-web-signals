@@ -56,19 +56,27 @@ table_outputs <- list(
 dir.create("results/tables", recursive = TRUE, showWarnings = FALSE)
 purrr::iwalk(
   table_outputs,
-  ~ readr::write_csv(.x, file.path("results", "tables", .y), na = "")
+  \(table, filename) readr::write_csv(
+    table,
+    file.path("results", "tables", filename),
+    na = ""
+  )
 )
 
 save_publication_plot(llms_rank_plot, "01-llms-presence-by-rank.png")
 save_publication_plot(group_restriction_plot, "02-restrictions-by-purpose.png")
-save_publication_plot(agent_restriction_plot, "03-restrictions-by-agent.png", height = 9)
+save_publication_plot(
+  agent_restriction_plot,
+  "03-restrictions-by-agent.png",
+  height = 9
+)
 save_publication_plot(content_signal_plot, "04-content-signals.png")
 save_publication_plot(overlap_plot, "05-llms-restriction-overlap.png")
 
 get_metric <- function(name) {
   metric <- key_metrics |>
     filter(.data$metric == name) |>
-    select(.data$numerator, .data$denominator, .data$proportion)
+    select(numerator, denominator, proportion)
 
   if (nrow(metric) != 1) {
     stop("Expected exactly one key metric named: ", name, call. = FALSE)
@@ -112,7 +120,9 @@ user_fetch_restriction_pct <- percent(
   user_fetch_restriction$proportion,
   accuracy = 0.1
 )
-most_restricted_agent_names <- toString(as.character(most_restricted_agent$agent))
+most_restricted_agent_names <- most_restricted_agent$agent |>
+  as.character() |>
+  toString()
 most_restricted_agent_phrase <- if (nrow(most_restricted_agent) == 1) {
   paste(most_restricted_agent_names, "had")
 } else {
@@ -124,16 +134,36 @@ most_restricted_agent_pct <- percent(
 )
 most_restricted_agent_n <- comma(most_restricted_agent$resolved_results[[1]])
 
-list_id <- if (is.null(tranco_metadata$list_id)) "26J39" else tranco_metadata$list_id
+format_metadata_date <- function(value) {
+  format(as.Date(substr(as.character(value), 1, 10)), "%d %B %Y")
+}
+
+list_id <- if (is.null(tranco_metadata$list_id)) {
+  "645ZX"
+} else {
+  tranco_metadata$list_id
+}
 list_url <- if (is.null(tranco_metadata$list_url)) {
-  "https://tranco-list.eu/list/26J39/1000000"
+  "https://tranco-list.eu/list/645ZX"
 } else {
   tranco_metadata$list_url
 }
-generated_on <- if (is.null(tranco_metadata$generated_on)) {
+retrieved_on <- if (is.null(tranco_metadata$retrieved_at)) {
   "16 August 2026"
 } else {
-  as.character(tranco_metadata$generated_on)
+  format_metadata_date(tranco_metadata$retrieved_at)
+}
+generation_note <- if (is.null(tranco_metadata$generated_on)) {
+  if (identical(list_id, "645ZX")) {
+    "The list was generated on 15 August 2026."
+  } else {
+    "The source metadata does not record the list's generation date."
+  }
+} else {
+  paste(
+    "The list was generated on",
+    format_metadata_date(tranco_metadata$generated_on)
+  )
 }
 ```
 
@@ -158,7 +188,8 @@ selected domains. Within that subset, `r training_restriction_pct` had at least
 one declared restriction for a training/control token. The corresponding
 descriptive proportions were `r search_restriction_pct` for AI search agents and
 `r user_fetch_restriction_pct` for user-triggered fetch agents. These are
-resolved-subset descriptions—not estimates for all 100,000 domains—and combine
+resolved-subset descriptions—not estimates for all 100,000 domains—and
+combine
 partial restrictions with full blocks.
 
 ```{r}
@@ -166,10 +197,10 @@ partial restrictions with full blocks.
 
 key_metrics |>
   select(
-    Metric = .data$metric,
-    Numerator = .data$numerator,
-    Denominator = .data$denominator,
-    Proportion = .data$proportion
+    Metric = metric,
+    Numerator = numerator,
+    Denominator = denominator,
+    Proportion = proportion
   ) |>
   gt() |>
   fmt_integer(columns = c("Numerator", "Denominator")) |>
@@ -220,14 +251,18 @@ still produce a usable result for one endpoint.
 endpoint_statuses |>
   arrange(.data$endpoint, desc(.data$count)) |>
   mutate(
-    endpoint = if_else(.data$endpoint == "llms.txt", "/llms.txt", "/robots.txt"),
+    endpoint = if_else(
+      .data$endpoint == "llms.txt",
+      "/llms.txt",
+      "/robots.txt"
+    ),
     status = gsub("_", " ", .data$status)
   ) |>
   select(
-    Endpoint = .data$endpoint,
-    Status = .data$status,
-    Count = .data$count,
-    Proportion = .data$proportion
+    Endpoint = endpoint,
+    Status = status,
+    Count = count,
+    Proportion = proportion
   ) |>
   gt(groupname_col = "Endpoint") |>
   fmt_integer(columns = "Count") |>
@@ -307,11 +342,12 @@ overlap_plot
 
 We scanned the top 100,000 pay-level domains from the standard Tranco list for
 publicly observable AI-related signals in `robots.txt` and `llms.txt`. The
-current inventory uses Tranco list `r list_id`, generated on `r generated_on`.^[
-Available at [`r list_url`](`r list_url`).] When
+current inventory uses Tranco list `r list_id`.^[Available at
+[`r list_url`](`r list_url`).] `r generation_note` The list was retrieved on
+`r retrieved_on`, and the scan was run on 16 August 2026. When
 `data/input/tranco-metadata.json` is present, the report uses that file as the
-source of truth for list provenance. The list was fetched and the scan was run
-on 16 August 2026.
+primary source for list provenance and supplies the verified 645ZX generation
+date when the metadata field is null.
 
 For each domain, the collector requested only `/llms.txt` and `/robots.txt`.
 The domain-level dataset contains endpoint classifications, three site-wide
