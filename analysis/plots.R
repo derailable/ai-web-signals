@@ -54,7 +54,12 @@ plot_llms_by_rank <- function(rank_summary) {
 
   ggplot(plot_data, aes(x = .data$rank_band, y = .data$llms_txt_proportion)) +
     geom_col(fill = "#4C78A8", width = 0.72) +
-    geom_text(aes(label = .data$label), vjust = -0.25, size = 3.3, lineheight = 0.95) +
+    geom_text(
+      aes(label = .data$label),
+      vjust = -0.25,
+      size = 3.3,
+      lineheight = 0.95
+    ) +
     scale_y_continuous(
       labels = percent_format(accuracy = 1),
       limits = c(
@@ -65,7 +70,10 @@ plot_llms_by_rank <- function(rank_summary) {
     ) +
     labs(
       title = "Observed /llms.txt presence by Tranco rank band",
-      subtitle = "Descriptive proportions use domains with a resolved /llms.txt result.",
+      subtitle = paste(
+        "Descriptive proportions use domains with a resolved",
+        "/llms.txt result."
+      ),
       x = NULL,
       y = "Share with an observed /llms.txt",
       caption = paste(
@@ -102,12 +110,16 @@ plot_group_restrictions <- function(group_summary) {
     ) +
     labs(
       title = "Tracked-agent restrictions by purpose",
-      subtitle = "All selected domains are shown, including unresolved policy observations.",
+      subtitle = paste(
+        "All selected domains are shown, including unresolved",
+        "policy observations."
+      ),
       x = NULL,
       y = "Share of all domains",
       fill = "Agents restricted",
       caption = paste(
-        "‘All’ means every tracked agent in the group has some restriction;",
+        "‘All’ means every tracked agent in the group has some",
+        "restriction;",
         "it does not mean every path is blocked."
       )
     ) +
@@ -143,7 +155,10 @@ plot_agent_restrictions <- function(agent_summary) {
     ) +
     labs(
       title = "Observed restriction proportions for tracked agents",
-      subtitle = "Partial and full restrictions count as restrictive in the resolved subset.",
+      subtitle = paste(
+        "Partial and full restrictions count as restrictive in",
+        "the resolved subset."
+      ),
       x = "Share of resolved policy observations",
       y = NULL,
       caption = paste(
@@ -152,7 +167,10 @@ plot_agent_restrictions <- function(agent_summary) {
       )
     ) +
     theme_ai_web_signals() +
-    theme(strip.text.y = element_text(angle = 0), panel.grid.major.y = element_blank())
+    theme(
+      strip.text.y = element_text(angle = 0),
+      panel.grid.major.y = element_blank()
+    )
 }
 
 plot_content_signals <- function(content_summary) {
@@ -184,7 +202,10 @@ plot_content_signals <- function(content_summary) {
     ) +
     labs(
       title = "Site-wide Content-Signal declarations",
-      subtitle = "All selected domains are shown; unspecified and unresolved are distinct.",
+      subtitle = paste(
+        "All selected domains are shown; unspecified and",
+        "unresolved are distinct."
+      ),
       x = NULL,
       y = "Share of all domains",
       fill = "Declaration",
@@ -221,8 +242,14 @@ plot_llms_restriction_overlap <- function(overlap_summary) {
       limits = c(0, 1)
     ) +
     labs(
-      title = "Observed /llms.txt files and tracked-agent restrictions can coexist",
-      subtitle = "Each row is normalized within the subset where both signals were resolved.",
+      title = paste(
+        "Observed /llms.txt files and tracked-agent restrictions",
+        "can coexist"
+      ),
+      subtitle = paste(
+        "Each row is normalized within the subset where both",
+        "signals were resolved."
+      ),
       x = NULL,
       y = NULL,
       fill = "Within-row share",
