@@ -26,6 +26,11 @@ agent_policy_col_types <- cols(
   policy = col_character()
 )
 
+domain_category_col_types <- cols_only(
+  domain = col_character(),
+  category = col_character()
+)
+
 domains <- read_csv(
   "data/processed/domains.csv",
   col_types = domain_col_types,
@@ -39,3 +44,18 @@ agent_policies <- read_csv(
   na = "",
   progress = FALSE
 )
+
+domain_categories <- read_csv(
+  "data/processed/categorized-domains.csv",
+  col_types = domain_category_col_types,
+  progress = FALSE
+)
+
+stopifnot(
+  !anyDuplicated(domain_categories$domain),
+  all(nzchar(domain_categories$category)),
+  setequal(domains$domain, domain_categories$domain)
+)
+
+categorized_domains <- domains |>
+  left_join(domain_categories, by = "domain")
